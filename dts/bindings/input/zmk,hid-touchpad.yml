@@ -1,0 +1,66 @@
+#
+# Copyright (c) 2022 The ZMK Contributors
+#
+# SPDX-License-Identifier: MIT
+#
+
+description: >
+  This is a representation of a generic Microsoft PTP mouse mode compliant I2C Touchpad.
+
+compatible: "zmk,hid-touchpad"
+
+include: [i2c-device.yaml]
+
+properties:
+  dr-gpios:
+    type: phandle-array
+    description: Interrupt pin for the trackpad
+
+  mouse-report-id:
+    type: int
+    description: Report ID for the mousemode Report
+    required: true
+
+  # Optional because the touchpad may only have mouse mode
+  inputmode-report-id:
+    type: int
+    description: Report ID (Usage 0x52) to switch between mouse and PTP mode
+
+  relative-x-off:
+    type: int
+    description: Offset in mousemode report where Relative-X data is at
+
+  relative-x-len:
+    type: int
+    description: Number of bytes of Relative-X data
+    enum:
+      - 1
+      - 2
+
+  relative-y-off:
+    type: int
+    description: Offset in mousemode report where Relative-X data is at
+
+  relative-y-len:
+    type: int
+    description: Number of bytes of Relative-Y data
+    enum:
+      - 1
+      - 2
+
+  button-off:
+    type: int
+    description: Offset in mousemode report where Button data is at
+
+  button-bit:
+    type: int
+    description: Which bit in the button byte the left mouse button is
+    enum:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7

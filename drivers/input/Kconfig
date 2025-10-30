@@ -1,0 +1,19 @@
+# Copyright (c) 2022 The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+menuconfig ZMK_HID_TOUCHPAD
+    bool "I2C HID Touchpad"
+    default y
+    depends on DT_HAS_ZMK_HID_TOUCHPAD_ENABLED && I2C
+    help
+      Enable driver for I2C HID Touchpads.
+
+if ZMK_HID_TOUCHPAD
+
+config INPUT_HID_TOUCHPAD_INIT_PRIORITY
+    int "Init priority"
+    default 75
+    help
+      Device driver initialization priority.
+
+endif #HID_TOUCHPAD
