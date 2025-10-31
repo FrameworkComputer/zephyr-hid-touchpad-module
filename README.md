@@ -18,6 +18,18 @@ Pinout
 | I2C INT  | D6   |
 
 ```
+# west.yml
+manifest:
+  remotes:
+    - name: FrameworkComputer
+      url-base: https://github.com/FrameworkComputer
+  projects:
+    - name: zephyr-hid-touchpad-module
+      revision: main
+      remote: FrameworkComputer
+```
+
+```
 # foo.conf
 CONFIG_I2C=y
 CONFIG_INPUT=y
