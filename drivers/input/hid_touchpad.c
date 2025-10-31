@@ -56,8 +56,8 @@ static void hid_touchpad_report_data(const struct device *dev) {
     }
 
     uint16_t report_len = sys_get_le16(&buf[0]);
-    LOG_ERR("Report Len: %04X ReportId: %d", report_len, buf[2]);
-    LOG_HEXDUMP_ERR(buf, sizeof(buf), "Raw Touchpad Data");
+    LOG_DBG("Report Len: %04X ReportId: %d", report_len, buf[2]);
+    LOG_HEXDUMP_DBG(buf, sizeof(buf), "Raw Touchpad Data");
     if (buf[2] != config->mouse_report_id) {
         LOG_ERR("Unexpected Report ID: %d", buf[2]);
         return;
@@ -78,7 +78,6 @@ static void hid_touchpad_report_data(const struct device *dev) {
     } else {
       dy = (int16_t)sys_get_le16(&buf[config->relative_y_off]);
     }
-    LOG_ERR("read X: %d, Y: %d, Button: %d", dx, dy, button);
     input_report_key(dev, INPUT_BTN_0, btn_val, false, K_FOREVER);
     input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
     input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
@@ -130,6 +129,7 @@ static int hid_touchpad_init(const struct device *dev) {
     int err = i2c_burst_read_dt(&config->i2c_bus, 0x20, &hid_desc[0], sizeof(hid_desc));
     if (err) {
       LOG_ERR("Failed to read hid descriptor with err: %d", err);
+      return -ENODEV;
     } else {
       LOG_INF("descLen       %02X%02X", hid_desc[1], hid_desc[0]);
       LOG_INF("bcdVer        %02X%02X", hid_desc[3], hid_desc[2]);
