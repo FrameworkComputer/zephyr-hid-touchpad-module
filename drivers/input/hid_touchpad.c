@@ -40,7 +40,10 @@ static int enable_ptp(const struct device *dev, uint8_t enable) {
 
     int err = i2c_write_dt(&config->i2c_bus, &cmd_data[0], sizeof(cmd_data));
 
-    LOG_DBG("set mousemode to %b", enable);
+    if (err)
+	    LOG_INF("Set mousemode to %d. Err: %d", enable, err);
+    else
+	    LOG_INF("FAILED to mousemode to %d", enable);
 
     return err;
 }
@@ -107,6 +110,25 @@ static void hid_touchpad_gpio_cb(const struct device *port, struct gpio_callback
     k_work_submit(&data->work);
 }
 
+#define BUCK_OFF      0x04
+#define BUCK1NORMVOUT 0x08
+#define BUCK2NORMVOUT 0x0A
+#define BUCKSWCTRLSEL 0x0F
+
+// i2c write_byte i2c@40003000 0x6b 0x408 0x18
+// i2c read_byte  i2c@40003000 0x6b 0x408
+// i2c write_byte i2c@40003000 0x6b 0x40F 1
+// 
+// i2c write_byte i2c@40003000 0x6b 0x408 0x18
+// i2c write_byte i2c@40003000 0x6b 0x40F 3
+
+int npm1300_reg_write(const struct i2c_dt_spec *dev_i2c, uint8_t base, uint8_t offset, uint8_t data)
+{
+	uint8_t buff[] = {base, offset, data};
+
+	return i2c_write_dt(dev_i2c, buff, sizeof(buff));
+}
+
 static int hid_touchpad_init(const struct device *dev) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
@@ -115,6 +137,24 @@ static int hid_touchpad_init(const struct device *dev) {
         LOG_WRN("i2c bus not ready!");
         return -EINVAL;
     }
+
+    const struct i2c_dt_spec dev_i2c = I2C_DT_SPEC_GET(DT_NODELABEL(npm1300));
+    // Enable both buck regulators at 3.3V
+    int res = npm1300_reg_write(&dev_i2c, BUCK_OFF, BUCK1NORMVOUT, 0x18);
+    if (res != 0) {
+        printk("zoid: Failed to initalize nPM1300\n");
+        return res;
+    }
+    //res = npm1300_reg_write(&dev_i2c, BUCK_OFF, BUCK2NORMVOUT, 0x18);
+    //if (res != 0) {
+    //    printk("zoid: Failed to initalize nPM1300\n");
+    //}
+    // Apply the changes
+    npm1300_reg_write(&dev_i2c, BUCK_OFF, BUCKSWCTRLSEL, 0x01);
+    if (res != 0) {
+        printk("zoid: Failed to initalize nPM1300\n");
+    }
+    printk("zoid: Initialized nPM1300\n");
 
     // TODO: Get version
     // uint16_t ic_version = 0;
