@@ -54,6 +54,16 @@ static void hid_touchpad_report_data(const struct device *dev) {
         LOG_ERR("failed to read mousemode report: %d", err);
         return;
     }
+    if (err == -EIO || err == -EBUSY) {
+        LOG_ERR("I2C error, attempting recovery");
+        i2c_recover_bus(config->i2c_bus.bus);
+
+        err = i2c_read_dt(&config->i2c_bus, &buf[0], sizeof(buf));
+        if (err != 0) {
+            LOG_ERR("failed to read mousemode (again after bus recovery) report: %d", err);
+            return;
+        }
+    }
 
     uint16_t report_len = sys_get_le16(&buf[0]);
     LOG_DBG("Report Len: %04X ReportId: %d", report_len, buf[2]);
@@ -116,6 +126,14 @@ static int hid_touchpad_init(const struct device *dev) {
         return -EINVAL;
     }
 
+    /* Check if the i2c bus requires recovery. Can happen if something went
+     * wrong with power sequencing */
+    int err = i2c_recover_bus(config->i2c_bus.bus);
+    if (err) {
+        /* Usually not fatal, but good to log */
+        LOG_WRN("I2C bus recovery failed or not supported: %d", err);
+    }
+
     // TODO: Get version
     // uint16_t ic_version = 0;
     // int err = read_register(dev, REG_VERSION, &ic_version);
@@ -126,7 +144,7 @@ static int hid_touchpad_init(const struct device *dev) {
 
 
     uint8_t hid_desc[26] = {0};
-    int err = i2c_burst_read_dt(&config->i2c_bus, 0x20, &hid_desc[0], sizeof(hid_desc));
+    err = i2c_burst_read_dt(&config->i2c_bus, 0x20, &hid_desc[0], sizeof(hid_desc));
     if (err) {
       LOG_ERR("Failed to read hid descriptor with err: %d", err);
       return -ENODEV;
