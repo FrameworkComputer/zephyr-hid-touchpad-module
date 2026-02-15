@@ -21,7 +21,20 @@ properties:
     description: Report ID for the mousemode Report
     required: true
 
-  # Optional because the touchpad may only have mouse mode
+  ptp-report-id:
+    type: int
+    description: Report ID for the PTP Report
+    required: true
+
+  reporting-mode:
+    description: Choose mouse mode or PTP (Precision Touchpad) reporting protocol. Mouse mode reports relative movement; PTP reports finger positions, allowing multitouch gestures.
+    type: string
+    required: true
+    enum:
+      - "mouse"
+      - "ptp"
+
+  # Optional because the touchpad may only one mode
   inputmode-report-id:
     type: int
     description: Report ID (Usage 0x52) to switch between mouse and PTP mode

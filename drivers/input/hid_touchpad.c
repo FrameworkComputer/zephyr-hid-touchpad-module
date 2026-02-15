@@ -22,6 +22,12 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_touchpad);
 
+#define PTP_REPORT_SIZE 32
+#define PTP_MAX_FINGERS 5
+#define PTP_CONTACT_SIZE 5
+
+// #define USE_FIFO 1
+
 static int enable_ptp(const struct device *dev, uint8_t enable) {
 
     struct hid_touchpad_data *const data = (struct hid_touchpad_data *const)dev->data;
@@ -45,7 +51,7 @@ static int enable_ptp(const struct device *dev, uint8_t enable) {
     return err;
 }
 
-static void hid_touchpad_report_data(const struct device *dev) {
+static void mouse_mode_report_data(const struct device *dev) {
     const struct hid_touchpad_config *config = dev->config;
 
     uint8_t buf[8] = {0};
@@ -73,8 +79,7 @@ static void hid_touchpad_report_data(const struct device *dev) {
         return;
     }
 
-    uint8_t button = buf[config->button_off];
-    bool btn_val = (button & BIT(config->button_bit)) == BIT(config->button_bit);
+    bool btn_val = IS_BIT_SET(buf[config->button_off], BIT(config->button_bit));
 
     int dx = 0;
     int dy = 0;
@@ -91,6 +96,87 @@ static void hid_touchpad_report_data(const struct device *dev) {
     input_report_key(dev, INPUT_BTN_0, btn_val, false, K_FOREVER);
     input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
     input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
+}
+
+static void ptp_mode_report_data(const struct device *dev) {
+    const struct hid_touchpad_config *config = dev->config;
+
+    uint8_t buf[PTP_REPORT_SIZE] = {0};
+    int err = i2c_read_dt(&config->i2c_bus, &buf[0], sizeof(buf));
+    if (err != 0) {
+        LOG_ERR("failed to read PTP report: %d", err);
+        return;
+    }
+    if (err == -EIO || err == -EBUSY) {
+        LOG_ERR("I2C error, attempting recovery");
+        i2c_recover_bus(config->i2c_bus.bus);
+
+        err = i2c_read_dt(&config->i2c_bus, &buf[0], sizeof(buf));
+        if (err != 0) {
+            LOG_ERR("failed to read PTP (again after bus recovery) report: %d", err);
+            return;
+        }
+    }
+
+    uint16_t report_len = sys_get_le16(&buf[0]);
+    LOG_DBG("Report Len: %04X ReportId: %d", report_len, buf[2]);
+    LOG_HEXDUMP_DBG(buf, sizeof(buf), "Raw Touchpad PTP Report");
+    if (buf[2] != config->ptp_report_id) {
+        LOG_ERR("Unexpected Report ID: %d", buf[2]);
+        return;
+    }
+
+    uint8_t contact_count = buf[28];
+    bool button_pressed = IS_BIT_SET(buf[29], BIT(0));
+    // Units of 100us
+    int16_t scan_time = sys_get_le16(&buf[30]);
+
+    int contacts_active = 0;
+    bool last_touch_status = false;
+    for (int contact = 0; contact < contact_count; contact++) {
+        size_t offset = 3 + (contact * PTP_CONTACT_SIZE);
+
+        if (offset + PTP_CONTACT_SIZE > sizeof(buf)) {
+            LOG_ERR("Report data out of bounds for contact %d", contact);
+            break;
+        }
+        uint8_t status_byte = buf[offset];
+        uint8_t finger_idx = status_byte >> 4;
+        bool confidence = IS_BIT_SET(status_byte, BIT(0));
+        bool tip_switch = IS_BIT_SET(status_byte, BIT(1));
+	last_touch_status = confidence && tip_switch;
+        if (confidence && tip_switch) {
+            contacts_active += 1;
+        }
+        uint16_t x_pos = sys_get_le16(&buf[offset + 1]);
+        uint16_t y_pos = sys_get_le16(&buf[offset + 3]);
+
+#if !USE_FIFO
+        input_report_abs(dev, INPUT_ABS_MT_SLOT, finger_idx, false, K_FOREVER);
+        input_report_abs(dev, INPUT_ABS_X, x_pos, false, K_FOREVER);
+        input_report_abs(dev, INPUT_ABS_Y, y_pos, false, K_FOREVER);
+        input_report_key(dev, INPUT_BTN_TOUCH, confidence && tip_switch, false, K_FOREVER);
+#endif
+    }
+
+    printk("Button: %d, Contacts: (%d/%d), Scan Time: %4d\n",
+        button_pressed, contact_count, contacts_active, scan_time);
+
+#if USE_FIFO
+    k_fifo_put(&ptp_touchpad_fifo, &buf);
+#else
+    // Sync finger events - have the HID driver send them to the host as a single report
+    if (contact_count > 0)
+        input_report_key(dev, INPUT_BTN_TOUCH, last_touch_status, true, K_FOREVER);
+#endif
+}
+
+static void hid_touchpad_report_data(const struct device *dev) {
+    const struct hid_touchpad_config *config = dev->config;
+    if (config->enable_ptp_mode)
+        ptp_mode_report_data(dev);
+    else
+        mouse_mode_report_data(dev);
 }
 
 static int set_int(const struct device *dev, const bool en) {
@@ -164,8 +250,8 @@ static int hid_touchpad_init(const struct device *dev) {
       data->data_reg = hid_desc[18];
     }
 
-    // Disable PTP to use mousemode
-    enable_ptp(dev, false);
+    // Switch touchpad to the configure mode
+    enable_ptp(dev, config->enable_ptp_mode);
 
     data->dev = dev;
     data->in_int = false;
@@ -209,6 +295,8 @@ static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_actio
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                 \
         .mouse_report_id = DT_INST_PROP(n, mouse_report_id),                                     \
         .inputmode_report_id = DT_INST_PROP(n, inputmode_report_id),                             \
+        .ptp_report_id = DT_INST_PROP(n, ptp_report_id),                                         \
+        .enable_ptp_mode = DT_INST_ENUM_IDX(n, reporting_mode),                                  \
         .relative_x_off = DT_INST_PROP(n, relative_x_off),                                       \
         .relative_x_len = DT_INST_PROP(n, relative_x_len),                                       \
         .relative_y_off = DT_INST_PROP(n, relative_y_off),                                       \
