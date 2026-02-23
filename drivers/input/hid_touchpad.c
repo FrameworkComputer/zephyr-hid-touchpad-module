@@ -11,9 +11,7 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/init.h>
-#include <zephyr/input/input.h>
 #include <zephyr/pm/device.h>
 
 #include "hid_touchpad.h"
@@ -22,75 +20,228 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_touchpad);
 
-static int enable_ptp(const struct device *dev, uint8_t enable) {
+/* Hardcoded 686-byte HID report descriptor from PCT1036 touchpad */
+const uint8_t tp_report_desc[] = {
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xa1, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+    0x95, 0x02, 0x81, 0x02, 0x95, 0x06, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30,
+    0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x03,
+    0x81, 0x06, 0x05, 0x0c, 0x0a, 0x38, 0x02, 0x75, 0x08, 0x95, 0x01, 0x81,
+    0x06, 0x75, 0x08, 0x95, 0x03, 0x81, 0x03, 0xc0, 0xc0, 0x05, 0x0d, 0x09,
+    0x05, 0xa1, 0x01, 0x85, 0x04, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09,
+    0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81,
+    0x02, 0x95, 0x02, 0x81, 0x03, 0x09, 0x51, 0x25, 0x0f, 0x75, 0x04, 0x95,
+    0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x75, 0x10, 0x55, 0x0e, 0x65,
+    0x11, 0x35, 0x00, 0x46, 0x94, 0x02, 0x27, 0x21, 0x04, 0x00, 0x00, 0x81,
+    0x02, 0x09, 0x31, 0x46, 0x48, 0x03, 0x27, 0x3e, 0x03, 0x00, 0x00, 0x81,
+    0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x47, 0x09, 0x42,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x02,
+    0x81, 0x03, 0x09, 0x51, 0x25, 0x0f, 0x75, 0x04, 0x95, 0x01, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x30, 0x75, 0x10, 0x55, 0x0e, 0x65, 0x11, 0x35, 0x00,
+    0x46, 0x94, 0x02, 0x27, 0x21, 0x04, 0x00, 0x00, 0x81, 0x02, 0x09, 0x31,
+    0x46, 0x48, 0x03, 0x27, 0x3e, 0x03, 0x00, 0x00, 0x81, 0x02, 0xc0, 0x05,
+    0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x47, 0x09, 0x42, 0x15, 0x00, 0x25,
+    0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x02, 0x81, 0x03, 0x09,
+    0x51, 0x25, 0x0f, 0x75, 0x04, 0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09,
+    0x30, 0x75, 0x10, 0x55, 0x0e, 0x65, 0x11, 0x35, 0x00, 0x46, 0x94, 0x02,
+    0x27, 0x21, 0x04, 0x00, 0x00, 0x81, 0x02, 0x09, 0x31, 0x46, 0x48, 0x03,
+    0x27, 0x3e, 0x03, 0x00, 0x00, 0x81, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22,
+    0xa1, 0x02, 0x09, 0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+    0x95, 0x02, 0x81, 0x02, 0x95, 0x02, 0x81, 0x03, 0x09, 0x51, 0x25, 0x0f,
+    0x75, 0x04, 0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x75, 0x10,
+    0x55, 0x0e, 0x65, 0x11, 0x35, 0x00, 0x46, 0x94, 0x02, 0x27, 0x21, 0x04,
+    0x00, 0x00, 0x81, 0x02, 0x09, 0x31, 0x46, 0x48, 0x03, 0x27, 0x3e, 0x03,
+    0x00, 0x00, 0x81, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09,
+    0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81,
+    0x02, 0x95, 0x02, 0x81, 0x03, 0x09, 0x51, 0x25, 0x0f, 0x75, 0x04, 0x95,
+    0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x75, 0x10, 0x55, 0x0e, 0x65,
+    0x11, 0x35, 0x00, 0x46, 0x94, 0x02, 0x27, 0x21, 0x04, 0x00, 0x00, 0x81,
+    0x02, 0x09, 0x31, 0x46, 0x48, 0x03, 0x27, 0x3e, 0x03, 0x00, 0x00, 0x81,
+    0x02, 0xc0, 0x05, 0x0d, 0x09, 0x54, 0x15, 0x00, 0x25, 0x05, 0x75, 0x08,
+    0x95, 0x01, 0x81, 0x02, 0x05, 0x09, 0x09, 0x01, 0x09, 0x02, 0x09, 0x03,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x95, 0x05,
+    0x81, 0x03, 0x05, 0x0d, 0x09, 0x56, 0x55, 0x0c, 0x66, 0x01, 0x10, 0x35,
+    0x00, 0x47, 0xff, 0xff, 0x00, 0x00, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00,
+    0x00, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02, 0x05, 0x0d, 0x09, 0x55, 0x15,
+    0x00, 0x25, 0x05, 0x75, 0x08, 0x95, 0x01, 0x85, 0x02, 0xb1, 0x02, 0x05,
+    0x0d, 0x09, 0x59, 0x15, 0x00, 0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x85,
+    0x06, 0xb1, 0x02, 0x05, 0x0d, 0x09, 0x60, 0x15, 0x00, 0x25, 0x01, 0x75,
+    0x01, 0x95, 0x01, 0x85, 0x07, 0xb1, 0x02, 0x95, 0x07, 0xb1, 0x03, 0x06,
+    0x00, 0xff, 0x09, 0xc5, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x96,
+    0x00, 0x01, 0x85, 0x0a, 0xb1, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x0e, 0xa1,
+    0x01, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x52, 0x15, 0x00, 0x25,
+    0x0a, 0x75, 0x08, 0x95, 0x01, 0x85, 0x03, 0xb1, 0x02, 0xc0, 0x05, 0x0d,
+    0x09, 0x22, 0xa1, 0x00, 0x09, 0x57, 0x09, 0x58, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x02, 0x85, 0x05, 0xb1, 0x02, 0x95, 0x06, 0xb1, 0x03,
+    0xc0, 0xc0, 0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x42, 0x09,
+    0x06, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x96, 0x03, 0x00, 0xb1,
+    0x02, 0x85, 0x41, 0x09, 0x05, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08,
+    0x96, 0x00, 0x01, 0xb1, 0x02, 0x85, 0x43, 0x09, 0x06, 0x15, 0x00, 0x26,
+    0xff, 0x00, 0x75, 0x08, 0x96, 0x03, 0x00, 0xb1, 0x02, 0x85, 0x0b, 0x09,
+    0x11, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x96, 0x01, 0x00, 0xb1,
+    0x02, 0xc0,
+};
+const size_t tp_report_desc_size = sizeof(tp_report_desc);
 
-    struct hid_touchpad_data *const data = (struct hid_touchpad_data *const)dev->data;
-    struct hid_touchpad_config *config = (struct hid_touchpad_config *)dev->config;
+int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
+                            uint8_t *buf, uint16_t buf_len, uint16_t *out_len) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
 
-    uint8_t mode = 0x00;
-    if (enable)
-        mode = 0x03;
+    uint8_t cmd[6];
+    if (id <= 0x0F) {
+        cmd[0] = data->command_reg;
+        cmd[1] = 0x00;
+        cmd[2] = type | id;
+        cmd[3] = I2C_HID_GET_REPORT;
+        cmd[4] = data->data_reg;
+        cmd[5] = 0x00;
+    } else {
+        /* For report IDs > 15, use the extended format */
+        uint8_t cmd_ext[7] = {
+            data->command_reg, 0x00,
+            type | 0x0F, I2C_HID_GET_REPORT,
+            id,
+            data->data_reg, 0x00,
+        };
+        int err = i2c_write_read_dt(&config->i2c_bus, cmd_ext, sizeof(cmd_ext),
+                                     buf, buf_len);
+        if (err) {
+            LOG_ERR("get_report (ext) failed: %d", err);
+            return err;
+        }
+        uint16_t len = sys_get_le16(buf);
+        if (len < 3 || len > buf_len) {
+            LOG_ERR("get_report (ext) invalid length: %d", len);
+            return -EINVAL;
+        }
+        /* buf[0..1] = length, buf[2] = report ID, buf[3..] = data */
+        *out_len = len - 3;
+        /* Shift data to start of buffer: data starts at buf[3] */
+        memmove(buf, &buf[3], *out_len);
+        return 0;
+    }
 
-    uint8_t cmd_data[10] = {
-        data->command_reg, 0x00,
-        FEATURE_REPORT | config->inputmode_report_id, SET_REPORT,
-        data->data_reg, 0x00,
-        0x04, 0x00, config->inputmode_report_id, mode
-    };
+    int err = i2c_write_read_dt(&config->i2c_bus, cmd, sizeof(cmd), buf, buf_len);
+    if (err) {
+        LOG_ERR("get_report failed: %d", err);
+        return err;
+    }
 
-    int err = i2c_write_dt(&config->i2c_bus, &cmd_data[0], sizeof(cmd_data));
+    uint16_t len = sys_get_le16(buf);
+    if (len < 3 || len > buf_len) {
+        LOG_ERR("get_report invalid length: %d", len);
+        return -EINVAL;
+    }
+    /* buf[0..1] = length, buf[2] = report ID, buf[3..] = data */
+    *out_len = len - 3;
+    memmove(buf, &buf[3], *out_len);
+    return 0;
+}
 
-    LOG_DBG("set mousemode to %b", enable);
+int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
+                            const uint8_t *report_data, uint16_t len) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
 
-    return err;
+    /* Wire format: [data_reg, 0x00, len_lo, len_hi, report_id, data...] */
+
+    if (id <= 0x0F) {
+        /* cmd: [cmd_reg, 0x00, (type|id), SET_REPORT] + [data_reg, 0x00, len_lo, len_hi, id, data...] */
+        uint8_t msg[4 + 4 + 1 + 256]; /* max feature report is 256 bytes */
+        if (9 + len > sizeof(msg)) {
+            return -ENOMEM;
+        }
+        msg[0] = data->command_reg;
+        msg[1] = 0x00;
+        msg[2] = type | id;
+        msg[3] = I2C_HID_SET_REPORT;
+        msg[4] = data->data_reg;
+        msg[5] = 0x00;
+        /* Length includes the 2 length bytes + report_id + data */
+        uint16_t payload_len = 2 + 1 + len;
+        sys_put_le16(payload_len, &msg[6]);
+        msg[8] = id;
+        if (len > 0) {
+            memcpy(&msg[9], report_data, len);
+        }
+        int err = i2c_write_dt(&config->i2c_bus, msg, 9 + len);
+        if (err) {
+            LOG_ERR("set_report failed: %d", err);
+        }
+        return err;
+    } else {
+        /* Extended format for report IDs > 15 */
+        uint8_t msg[5 + 4 + 1 + 256];
+        if (10 + len > sizeof(msg)) {
+            return -ENOMEM;
+        }
+        msg[0] = data->command_reg;
+        msg[1] = 0x00;
+        msg[2] = type | 0x0F;
+        msg[3] = I2C_HID_SET_REPORT;
+        msg[4] = id;
+        msg[5] = data->data_reg;
+        msg[6] = 0x00;
+        uint16_t payload_len = 2 + 1 + len;
+        sys_put_le16(payload_len, &msg[7]);
+        msg[9] = id;
+        if (len > 0) {
+            memcpy(&msg[10], report_data, len);
+        }
+        int err = i2c_write_dt(&config->i2c_bus, msg, 10 + len);
+        if (err) {
+            LOG_ERR("set_report (ext) failed: %d", err);
+        }
+        return err;
+    }
+}
+
+void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb) {
+    struct hid_touchpad_data *data = dev->data;
+    if (data->num_cbs < HID_TOUCHPAD_MAX_CBS) {
+        data->input_cbs[data->num_cbs++] = cb;
+    } else {
+        LOG_ERR("Too many input callbacks registered");
+    }
 }
 
 static void hid_touchpad_report_data(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
-    uint8_t buf[8] = {0};
-    int err = i2c_read_dt(&config->i2c_bus, &buf[0], sizeof(buf));
-    if (err != 0) {
-        LOG_ERR("failed to read mousemode report: %d", err);
+    int err = i2c_read_dt(&config->i2c_bus, data->report_buf, data->max_input_len);
+    if (err) {
+        LOG_ERR("failed to read input report: %d", err);
         return;
     }
-    if (err == -EIO || err == -EBUSY) {
-        LOG_ERR("I2C error, attempting recovery");
-        i2c_recover_bus(config->i2c_bus.bus);
 
-        err = i2c_read_dt(&config->i2c_bus, &buf[0], sizeof(buf));
-        if (err != 0) {
-            LOG_ERR("failed to read mousemode (again after bus recovery) report: %d", err);
-            return;
+    uint16_t report_len = sys_get_le16(data->report_buf);
+    if (report_len == 0 || report_len == 0xFFFF) {
+        /* Reset signal or no data */
+        return;
+    }
+    if (report_len < 3) {
+        LOG_WRN("report too short: %d", report_len);
+        return;
+    }
+    if (report_len > data->max_input_len) {
+        LOG_WRN("report length %d exceeds max %d", report_len, data->max_input_len);
+        report_len = data->max_input_len;
+    }
+
+    uint8_t report_id = data->report_buf[2];
+    /* Data starts at byte 3, length is report_len - 2 (minus the 2-byte length prefix) - 1 (report ID) */
+    uint16_t data_len = report_len - 3;
+
+    LOG_DBG("Report ID: %d, Len: %d", report_id, data_len);
+    LOG_HEXDUMP_DBG(&data->report_buf[2], report_len - 2, "Raw report");
+
+    for (int i = 0; i < data->num_cbs; i++) {
+        if (data->input_cbs[i]) {
+            data->input_cbs[i](dev, report_id, &data->report_buf[3], data_len);
         }
     }
-
-    uint16_t report_len = sys_get_le16(&buf[0]);
-    LOG_DBG("Report Len: %04X ReportId: %d", report_len, buf[2]);
-    LOG_HEXDUMP_DBG(buf, sizeof(buf), "Raw Touchpad Data");
-    if (buf[2] != config->mouse_report_id) {
-        LOG_ERR("Unexpected Report ID: %d", buf[2]);
-        return;
-    }
-
-    uint8_t button = buf[config->button_off];
-    bool btn_val = (button & BIT(config->button_bit)) == BIT(config->button_bit);
-
-    int dx = 0;
-    int dy = 0;
-    if (config->relative_x_len == 1) {
-      dx = (int8_t)buf[config->relative_x_off];
-    } else {
-      dx = (int16_t)sys_get_le16(&buf[config->relative_x_off]);
-    }
-    if (config->relative_x_len == 1) {
-      dy = (int8_t)buf[config->relative_y_off];
-    } else {
-      dy = (int16_t)sys_get_le16(&buf[config->relative_y_off]);
-    }
-    input_report_key(dev, INPUT_BTN_0, btn_val, false, K_FOREVER);
-    input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
-    input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
 }
 
 static int set_int(const struct device *dev, const bool en) {
@@ -100,7 +251,6 @@ static int set_int(const struct device *dev, const bool en) {
     if (ret < 0) {
         LOG_ERR("can't set interrupt");
     }
-
     return ret;
 }
 
@@ -109,11 +259,9 @@ static void hid_touchpad_work_cb(struct k_work *work) {
     hid_touchpad_report_data(data->dev);
 }
 
-static void hid_touchpad_gpio_cb(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
+static void hid_touchpad_gpio_cb(const struct device *port, struct gpio_callback *cb,
+                                  uint32_t pins) {
     struct hid_touchpad_data *data = CONTAINER_OF(cb, struct hid_touchpad_data, gpio_cb);
-
-    LOG_DBG("HW DR asserted");
-    data->in_int = true;
     k_work_submit(&data->work);
 }
 
@@ -126,49 +274,48 @@ static int hid_touchpad_init(const struct device *dev) {
         return -EINVAL;
     }
 
-    /* Check if the i2c bus requires recovery. Can happen if something went
-     * wrong with power sequencing */
     int err = i2c_recover_bus(config->i2c_bus.bus);
     if (err) {
-        /* Usually not fatal, but good to log */
         LOG_WRN("I2C bus recovery failed or not supported: %d", err);
     }
 
-    // TODO: Get version
-    // uint16_t ic_version = 0;
-    // int err = read_register(dev, REG_VERSION, &ic_version);
-    // if (err != 0) {
-    //     LOG_WRN("could not get IC version!");
-    //     return err;
-    // }
-
-
-    uint8_t hid_desc[26] = {0};
-    err = i2c_burst_read_dt(&config->i2c_bus, 0x20, &hid_desc[0], sizeof(hid_desc));
+    /* Read 30-byte I2C HID descriptor from register 0x20 */
+    uint8_t hid_desc[30] = {0};
+    err = i2c_burst_read_dt(&config->i2c_bus, 0x20, hid_desc, sizeof(hid_desc));
     if (err) {
-      LOG_ERR("Failed to read hid descriptor with err: %d", err);
-      return -ENODEV;
-    } else {
-      LOG_INF("descLen       %02X%02X", hid_desc[1], hid_desc[0]);
-      LOG_INF("bcdVer        %02X%02X", hid_desc[3], hid_desc[2]);
-      LOG_INF("reportDescLen %02X%02X", hid_desc[5], hid_desc[4]);
-      LOG_INF("reportDescReg %02X%02X", hid_desc[7], hid_desc[6]);
-      LOG_INF("wInputReg     %02X%02X", hid_desc[9], hid_desc[8]);
-      LOG_INF("wCommandReg   %02X%02X", hid_desc[17], hid_desc[16]);
-      LOG_INF("wDataReg      %02X%02X", hid_desc[19], hid_desc[18]);
-      LOG_INF("PID           %02X%02X", hid_desc[23], hid_desc[22]);
-      LOG_INF("VID           %02X%02X", hid_desc[21], hid_desc[20]);
-      LOG_INF("PID           %02X%02X", hid_desc[23], hid_desc[22]);
-      LOG_INF("Version       %02X%02X", hid_desc[25], hid_desc[24]);
-      data->command_reg = hid_desc[16];
-      data->data_reg = hid_desc[18];
+        LOG_ERR("Failed to read HID descriptor: %d", err);
+        return -ENODEV;
     }
 
-    // Disable PTP to use mousemode
-    enable_ptp(dev, false);
+    LOG_INF("descLen       %02X%02X", hid_desc[1], hid_desc[0]);
+    LOG_INF("bcdVer        %02X%02X", hid_desc[3], hid_desc[2]);
+    LOG_INF("reportDescLen %02X%02X", hid_desc[5], hid_desc[4]);
+    LOG_INF("reportDescReg %02X%02X", hid_desc[7], hid_desc[6]);
+    LOG_INF("wInputReg     %02X%02X", hid_desc[9], hid_desc[8]);
+    LOG_INF("wCommandReg   %02X%02X", hid_desc[17], hid_desc[16]);
+    LOG_INF("wDataReg      %02X%02X", hid_desc[19], hid_desc[18]);
+    LOG_INF("VID           %02X%02X", hid_desc[21], hid_desc[20]);
+    LOG_INF("PID           %02X%02X", hid_desc[23], hid_desc[22]);
+    LOG_INF("Version       %02X%02X", hid_desc[25], hid_desc[24]);
+
+    data->command_reg = hid_desc[16];
+    data->data_reg = hid_desc[18];
+    data->input_reg = sys_get_le16(&hid_desc[8]);
+    data->max_input_len = sys_get_le16(&hid_desc[10]);
+
+    /* Clamp max_input_len to our buffer size */
+    if (data->max_input_len > sizeof(data->report_buf)) {
+        LOG_WRN("max_input_len %d exceeds buffer, clamping to %d",
+                data->max_input_len, (int)sizeof(data->report_buf));
+        data->max_input_len = sizeof(data->report_buf);
+    }
+
+    LOG_INF("command_reg=0x%02x data_reg=0x%02x input_reg=0x%04x max_input_len=%d",
+            data->command_reg, data->data_reg, data->input_reg, data->max_input_len);
+
+    /* Do NOT disable PTP — let the OS control input mode via feature reports */
 
     data->dev = dev;
-    data->in_int = false;
 
     gpio_pin_configure_dt(&config->dr, GPIO_INPUT);
     gpio_init_callback(&data->gpio_cb, hid_touchpad_gpio_cb, BIT(config->dr.pin));
@@ -182,7 +329,7 @@ static int hid_touchpad_init(const struct device *dev) {
 
     k_work_init(&data->work, hid_touchpad_work_cb);
 
-    LOG_INF("device initialized at 0x%x", config->i2c_bus.addr);
+    LOG_INF("HID touchpad passthrough initialized at 0x%x", config->i2c_bus.addr);
 
     return 0;
 }
@@ -200,25 +347,17 @@ static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_actio
     }
 }
 
-#endif // IS_ENABLED(CONFIG_PM_DEVICE)
+#endif /* IS_ENABLED(CONFIG_PM_DEVICE) */
 
-#define HID_TOUCHPAD_INIT(n)                                                                          \
-    static struct hid_touchpad_data hid_touchpad_data_##n;                                                 \
-    static const struct hid_touchpad_config hid_touchpad_config_##n = {                                    \
+#define HID_TOUCHPAD_INIT(n)                                                                      \
+    static struct hid_touchpad_data hid_touchpad_data_##n;                                        \
+    static const struct hid_touchpad_config hid_touchpad_config_##n = {                           \
         .i2c_bus = I2C_DT_SPEC_INST_GET(n),                                                      \
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                 \
-        .mouse_report_id = DT_INST_PROP(n, mouse_report_id),                                     \
-        .inputmode_report_id = DT_INST_PROP(n, inputmode_report_id),                             \
-        .relative_x_off = DT_INST_PROP(n, relative_x_off),                                       \
-        .relative_x_len = DT_INST_PROP(n, relative_x_len),                                       \
-        .relative_y_off = DT_INST_PROP(n, relative_y_off),                                       \
-        .relative_y_len = DT_INST_PROP(n, relative_y_len),                                       \
-        .button_off = DT_INST_PROP(n, button_off),                                               \
-        .button_bit = DT_INST_PROP(n, button_bit),                                               \
-    };                                                                                           \
-    PM_DEVICE_DT_INST_DEFINE(n, hid_touchpad_pm_action);                                              \
-    DEVICE_DT_INST_DEFINE(n, hid_touchpad_init, PM_DEVICE_DT_INST_GET(n), &hid_touchpad_data_##n,          \
-                          &hid_touchpad_config_##n, POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY,          \
-                          NULL);
+    };                                                                                            \
+    PM_DEVICE_DT_INST_DEFINE(n, hid_touchpad_pm_action);                                          \
+    DEVICE_DT_INST_DEFINE(n, hid_touchpad_init, PM_DEVICE_DT_INST_GET(n),                         \
+                          &hid_touchpad_data_##n, &hid_touchpad_config_##n,                       \
+                          POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY, NULL);
 
 DT_INST_FOREACH_STATUS_OKAY(HID_TOUCHPAD_INIT)

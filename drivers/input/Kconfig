@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: MIT
 
 menuconfig ZMK_HID_TOUCHPAD
-    bool "I2C HID Touchpad"
+    bool "I2C HID Touchpad Passthrough"
     default y
     depends on DT_HAS_ZMK_HID_TOUCHPAD_ENABLED && I2C
     help
-      Enable driver for I2C HID Touchpads.
+      Enable I2C HID touchpad passthrough driver.
 
 if ZMK_HID_TOUCHPAD
 
@@ -15,5 +15,19 @@ config INPUT_HID_TOUCHPAD_INIT_PRIORITY
     default 75
     help
       Device driver initialization priority.
+
+config HID_PASSTHROUGH_USB
+    bool "USB HID Passthrough for touchpad"
+    depends on USB_DEVICE_HID
+    default y
+    help
+      Enable USB HID passthrough for the touchpad on HID_1.
+
+config HID_PASSTHROUGH_BLE
+    bool "BLE HID Passthrough for touchpad"
+    depends on BT
+    default y
+    help
+      Enable BLE HOGP passthrough for the touchpad as a second HID service.
 
 endif #HID_TOUCHPAD
