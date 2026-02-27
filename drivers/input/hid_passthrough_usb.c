@@ -12,7 +12,7 @@
 #include "hid_touchpad.h"
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_INPUT_LOG_LEVEL);
+LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
 
 #define HID_GET_REPORT_TYPE_MASK 0xFF00
 #define HID_GET_REPORT_ID_MASK   0x00FF
@@ -34,6 +34,7 @@ static int get_report_cb(const struct device *dev, struct usb_setup_packet *setu
                           int32_t *len, uint8_t **data) {
     uint16_t report_type = setup->wValue & HID_GET_REPORT_TYPE_MASK;
     uint8_t report_id = setup->wValue & HID_GET_REPORT_ID_MASK;
+    LOG_DBG("get_report_cb: type=0x%04x id=0x%02x", report_type, report_id);
     uint8_t i2c_type;
 
     switch (report_type) {
@@ -69,6 +70,7 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
                           int32_t *len, uint8_t **data) {
     uint16_t report_type = setup->wValue & HID_GET_REPORT_TYPE_MASK;
     uint8_t report_id = setup->wValue & HID_GET_REPORT_ID_MASK;
+    LOG_DBG("set_report_cb: type=0x%04x id=0x%02x len=%d", report_type, report_id, *len);
     uint8_t i2c_type;
 
     switch (report_type) {

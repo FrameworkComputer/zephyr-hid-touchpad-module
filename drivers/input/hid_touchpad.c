@@ -16,9 +16,8 @@
 
 #include "hid_touchpad.h"
 
-#define LOG_LEVEL CONFIG_INPUT_LOG_LEVEL
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(hid_touchpad);
+LOG_MODULE_REGISTER(hid_touchpad, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
 
 /* HID report descriptor from devicetree */
 const uint8_t tp_report_desc[] = DT_INST_PROP(0, report_descriptor);
@@ -51,6 +50,8 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
             LOG_ERR("get_report (ext) failed: %d", err);
             return err;
         }
+        LOG_HEXDUMP_DBG(cmd_ext, sizeof(cmd_ext), "get_report ext cmd");
+        LOG_HEXDUMP_DBG(buf, MIN(16, buf_len), "get_report ext raw resp");
         uint16_t len = sys_get_le16(buf);
         if (len < 3 || len > buf_len) {
             LOG_ERR("get_report (ext) invalid length: %d", len);
@@ -130,6 +131,7 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
         if (len > 0) {
             memcpy(&msg[10], report_data, len);
         }
+        LOG_HEXDUMP_DBG(msg, 10 + len, "set_report ext I2C write");
         int err = i2c_write_dt(&config->i2c_bus, msg, 10 + len);
         if (err) {
             LOG_ERR("set_report (ext) failed: %d", err);

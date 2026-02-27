@@ -13,7 +13,7 @@
 #include "hid_touchpad.h"
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_INPUT_LOG_LEVEL);
+LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_HID_PASSTHROUGH_BLE_LOG_LEVEL);
 
 #define TP_NODE DT_NODELABEL(touchpad)
 

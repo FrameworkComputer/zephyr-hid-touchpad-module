@@ -30,4 +30,16 @@ config HID_PASSTHROUGH_BLE
     help
       Enable BLE HOGP passthrough for the touchpad as a second HID service.
 
+module = HID_TOUCHPAD
+module-str = hid_touchpad
+source "subsys/logging/Kconfig.template.log_config"
+
+module = HID_PASSTHROUGH_USB
+module-str = hid_passthrough_usb
+source "subsys/logging/Kconfig.template.log_config"
+
+module = HID_PASSTHROUGH_BLE
+module-str = hid_passthrough_ble
+source "subsys/logging/Kconfig.template.log_config"
+
 endif #HID_TOUCHPAD
