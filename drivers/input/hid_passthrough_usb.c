@@ -47,19 +47,21 @@ static int get_report_cb(const struct device *dev, struct usb_setup_packet *setu
         return -ENOTSUP;
     }
 
-    /* Use a static buffer for the response. Max feature report is 256 bytes + overhead. */
-    static uint8_t report_buf[264];
+    /* Use a static buffer for the response. Max feature report is 256 bytes + overhead.
+     * Zephyr USB HID expects the report ID as the first byte of the response. */
+    static uint8_t report_buf[265];
     uint16_t out_len = 0;
 
+    report_buf[0] = report_id;
     int err = hid_touchpad_get_report(tp_dev, i2c_type, report_id,
-                                      report_buf, sizeof(report_buf), &out_len);
+                                      report_buf + 1, sizeof(report_buf) - 1, &out_len);
     if (err) {
         LOG_ERR("get_report proxy failed for type=0x%02x id=%d: %d", i2c_type, report_id, err);
         return err;
     }
 
     *data = report_buf;
-    *len = out_len;
+    *len = out_len + 1;
     return 0;
 }
 
@@ -80,7 +82,10 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
         return -ENOTSUP;
     }
 
-    int err = hid_touchpad_set_report(tp_dev, i2c_type, report_id, *data, *len);
+    /* Zephyr USB HID includes the report ID as the first byte of *data.
+     * Skip it — hid_touchpad_set_report adds the report ID itself. */
+    int err = hid_touchpad_set_report(tp_dev, i2c_type, report_id,
+                                      *data + 1, *len - 1);
     if (err) {
         LOG_ERR("set_report proxy failed for type=0x%02x id=%d: %d", i2c_type, report_id, err);
         return err;
