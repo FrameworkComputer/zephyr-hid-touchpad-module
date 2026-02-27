@@ -16,3 +16,38 @@ properties:
   dr-gpios:
     type: phandle-array
     description: Interrupt (data ready) pin for the touchpad
+
+  hid-descriptor-register:
+    type: int
+    required: true
+    description: I2C register address for the HID descriptor (e.g. 0x20)
+
+  report-descriptor:
+    type: uint8-array
+    required: true
+    description: Full HID report descriptor blob
+
+  mouse-input-report-id:
+    type: int
+    required: true
+    description: Report ID for mouse input reports (e.g. 1)
+
+  ptp-input-report-id:
+    type: int
+    required: true
+    description: Report ID for PTP (precision touchpad) input reports (e.g. 4)
+
+  mouse-input-report-size:
+    type: int
+    required: true
+    description: Size in bytes of mouse input report data (excluding report ID)
+
+  ptp-input-report-size:
+    type: int
+    required: true
+    description: Size in bytes of PTP input report data (excluding report ID)
+
+  feature-report-ids:
+    type: array
+    required: true
+    description: List of feature report IDs exposed by this touchpad

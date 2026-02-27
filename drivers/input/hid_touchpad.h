@@ -29,6 +29,7 @@ extern const size_t tp_report_desc_size;
 struct hid_touchpad_config {
     struct i2c_dt_spec i2c_bus;
     const struct gpio_dt_spec dr;
+    uint8_t hid_desc_register;
 };
 
 typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report_id,

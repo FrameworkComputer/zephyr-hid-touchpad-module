@@ -8,11 +8,19 @@
 #include <zephyr/init.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/sys/util.h>
 
 #include "hid_touchpad.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_INPUT_LOG_LEVEL);
+
+#define TP_NODE DT_NODELABEL(touchpad)
+
+#define TP_MOUSE_INPUT_REPORT_ID  DT_PROP(TP_NODE, mouse_input_report_id)
+#define TP_PTP_INPUT_REPORT_ID    DT_PROP(TP_NODE, ptp_input_report_id)
+#define TP_MOUSE_INPUT_REPORT_SIZE DT_PROP(TP_NODE, mouse_input_report_size)
+#define TP_PTP_INPUT_REPORT_SIZE  DT_PROP(TP_NODE, ptp_input_report_size)
 
 enum {
     HIDS_REMOTE_WAKE = BIT(0),
@@ -42,27 +50,22 @@ static struct hids_info tp_info = {
     .flags = HIDS_NORMALLY_CONNECTABLE | HIDS_REMOTE_WAKE,
 };
 
-/* Report reference descriptors for all known reports */
-static struct hids_report mouse_input_ref = { .id = 1, .type = HIDS_INPUT };
-static struct hids_report ptp_input_ref = { .id = 4, .type = HIDS_INPUT };
+/* Report reference descriptors for input reports */
+static struct hids_report mouse_input_ref = { .id = TP_MOUSE_INPUT_REPORT_ID, .type = HIDS_INPUT };
+static struct hids_report ptp_input_ref = { .id = TP_PTP_INPUT_REPORT_ID, .type = HIDS_INPUT };
 
-static struct hids_report feature_2_ref = { .id = 2, .type = HIDS_FEATURE };
-static struct hids_report feature_3_ref = { .id = 3, .type = HIDS_FEATURE };
-static struct hids_report feature_5_ref = { .id = 5, .type = HIDS_FEATURE };
-static struct hids_report feature_6_ref = { .id = 6, .type = HIDS_FEATURE };
-static struct hids_report feature_7_ref = { .id = 7, .type = HIDS_FEATURE };
-static struct hids_report feature_10_ref = { .id = 10, .type = HIDS_FEATURE };
-static struct hids_report feature_11_ref = { .id = 11, .type = HIDS_FEATURE };
-static struct hids_report feature_65_ref = { .id = 65, .type = HIDS_FEATURE };
-static struct hids_report feature_66_ref = { .id = 66, .type = HIDS_FEATURE };
-static struct hids_report feature_67_ref = { .id = 67, .type = HIDS_FEATURE };
+/* Generate feature report reference descriptors from devicetree */
+#define FEATURE_REF_DECL(node, prop, idx) \
+    static struct hids_report feature_ref_##idx = { \
+        .id = DT_PROP_BY_IDX(node, prop, idx), .type = HIDS_FEATURE };
+DT_FOREACH_PROP_ELEM(TP_NODE, feature_report_ids, FEATURE_REF_DECL)
 
 static uint8_t ctrl_point;
 static const struct device *tp_dev;
 
 /* Cached last input reports for BLE read */
-static uint8_t cached_mouse_report[8];
-static uint8_t cached_ptp_report[29];
+static uint8_t cached_mouse_report[TP_MOUSE_INPUT_REPORT_SIZE];
+static uint8_t cached_ptp_report[TP_PTP_INPUT_REPORT_SIZE];
 
 /* ---- GATT read/write callbacks ---- */
 
@@ -147,52 +150,16 @@ static ssize_t write_ctrl_point(struct bt_conn *conn, const struct bt_gatt_attr 
     return len;
 }
 
-/*
- * Static GATT service definition for touchpad HID passthrough.
- *
- * Attribute index reference:
- *  0: Primary Service (HIDS)
- *  1: HID Info Characteristic declaration
- *  2: HID Info value
- *  3: Report Map Characteristic declaration
- *  4: Report Map value
- *
- *  5: Mouse Input Report (ID=1) Characteristic declaration
- *  6: Mouse Input Report value                         ← notify target for mouse
- *  7: Mouse Input Report CCC
- *  8: Mouse Input Report Reference
- *
- *  9: PTP Input Report (ID=4) Characteristic declaration
- * 10: PTP Input Report value                            ← notify target for PTP
- * 11: PTP Input Report CCC
- * 12: PTP Input Report Reference
- *
- * 13-14: Feature ID 2 (Characteristic decl + value)
- * 15: Feature ID 2 Report Reference
- * 16-17: Feature ID 3
- * 18: Feature ID 3 Report Reference
- * 19-20: Feature ID 5
- * 21: Feature ID 5 Report Reference
- * 22-23: Feature ID 6
- * 24: Feature ID 6 Report Reference
- * 25-26: Feature ID 7
- * 27: Feature ID 7 Report Reference
- * 28-29: Feature ID 10
- * 30: Feature ID 10 Report Reference
- * 31-32: Feature ID 11
- * 33: Feature ID 11 Report Reference
- * 34-35: Feature ID 65
- * 36: Feature ID 65 Report Reference
- * 37-38: Feature ID 66
- * 39: Feature ID 66 Report Reference
- * 40-41: Feature ID 67
- * 42: Feature ID 67 Report Reference
- *
- * 43: HID Control Point Characteristic declaration
- * 44: HID Control Point value
- */
+/* Macro to generate GATT feature report attributes from devicetree */
+#define FEATURE_GATT_ATTRS(node, prop, idx) \
+    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, \
+                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP, \
+                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT, \
+                           read_feature_report, write_feature_report, &feature_ref_##idx), \
+    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT, \
+                       read_hids_report_ref, NULL, &feature_ref_##idx),
 
-/* Attribute indices for notify targets */
+/* Attribute indices for notify targets (stable: precede variable-length feature section) */
 #define TP_MOUSE_INPUT_ATTR_IDX  6
 #define TP_PTP_INPUT_ATTR_IDX   10
 
@@ -208,99 +175,22 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT_MAP, BT_GATT_CHRC_READ,
                            BT_GATT_PERM_READ_ENCRYPT, read_hids_report_map, NULL, NULL),
 
-    /* Input Report ID 1 (Mouse) */
+    /* Input Report: Mouse */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_READ_ENCRYPT, read_mouse_input_report, NULL, NULL),
     BT_GATT_CCC(tp_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
     BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
                        read_hids_report_ref, NULL, &mouse_input_ref),
 
-    /* Input Report ID 4 (PTP multitouch) */
+    /* Input Report: PTP multitouch */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_READ_ENCRYPT, read_ptp_input_report, NULL, NULL),
     BT_GATT_CCC(tp_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
     BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
                        read_hids_report_ref, NULL, &ptp_input_ref),
 
-    /* Feature Report ID 2 (Contact Max) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_2_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_2_ref),
-
-    /* Feature Report ID 3 (Input Mode) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_3_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_3_ref),
-
-    /* Feature Report ID 5 (Surface/Button Switch) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_5_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_5_ref),
-
-    /* Feature Report ID 6 (Button Type) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_6_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_6_ref),
-
-    /* Feature Report ID 7 (Vendor) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_7_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_7_ref),
-
-    /* Feature Report ID 10 (Vendor, 256 bytes) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_10_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_10_ref),
-
-    /* Feature Report ID 11 (Vendor) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_11_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_11_ref),
-
-    /* Feature Report ID 65 (Vendor FW update, 256 bytes) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_65_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_65_ref),
-
-    /* Feature Report ID 66 (Vendor FW update) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_66_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_66_ref),
-
-    /* Feature Report ID 67 (Vendor FW update) */
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-                           read_feature_report, write_feature_report, &feature_67_ref),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
-                       read_hids_report_ref, NULL, &feature_67_ref),
+    /* Feature reports (generated from devicetree) */
+    DT_FOREACH_PROP_ELEM(TP_NODE, feature_report_ids, FEATURE_GATT_ATTRS)
 
     /* HID Control Point */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
@@ -313,7 +203,7 @@ static struct k_work_q tp_hog_work_q;
 /* Message queue entry: report_id + data */
 struct tp_report_msg {
     uint8_t report_id;
-    uint8_t data[29]; /* Max is PTP at 29 bytes */
+    uint8_t data[MAX(TP_MOUSE_INPUT_REPORT_SIZE, TP_PTP_INPUT_REPORT_SIZE)];
     uint16_t len;
 };
 
@@ -340,11 +230,11 @@ static void send_tp_report_callback(struct k_work *work) {
         bt_conn_foreach(BT_CONN_TYPE_LE, collect_conn_cb, &ctx);
 
         const struct bt_gatt_attr *attr;
-        if (msg.report_id == 1) {
+        if (msg.report_id == TP_MOUSE_INPUT_REPORT_ID) {
             attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
             memcpy(cached_mouse_report, msg.data,
                    MIN(msg.len, sizeof(cached_mouse_report)));
-        } else if (msg.report_id == 4) {
+        } else if (msg.report_id == TP_PTP_INPUT_REPORT_ID) {
             attr = &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
             memcpy(cached_ptp_report, msg.data,
                    MIN(msg.len, sizeof(cached_ptp_report)));
@@ -378,7 +268,7 @@ K_WORK_DEFINE(tp_hog_work, send_tp_report_callback);
 static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
                              const uint8_t *data, uint16_t len) {
     /* Only forward input reports (mouse and PTP) */
-    if (report_id != 1 && report_id != 4) {
+    if (report_id != TP_MOUSE_INPUT_REPORT_ID && report_id != TP_PTP_INPUT_REPORT_ID) {
         return;
     }
 
@@ -397,7 +287,7 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
 }
 
 static int hid_passthrough_ble_init(void) {
-    tp_dev = DEVICE_DT_GET(DT_NODELABEL(touchpad));
+    tp_dev = DEVICE_DT_GET(TP_NODE);
     if (!device_is_ready(tp_dev)) {
         LOG_ERR("Touchpad device not ready");
         return -ENODEV;
