@@ -10,17 +10,17 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/util.h>
 
-#include "hid_touchpad.h"
+#include "i2c_hid.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_HID_PASSTHROUGH_BLE_LOG_LEVEL);
 
-#define TP_NODE DT_NODELABEL(touchpad)
+#define I2C_HID_NODE DT_NODELABEL(i2c_hid)
 
-#define TP_MOUSE_INPUT_REPORT_ID  DT_PROP(TP_NODE, mouse_input_report_id)
-#define TP_PTP_INPUT_REPORT_ID    DT_PROP(TP_NODE, ptp_input_report_id)
-#define TP_MOUSE_INPUT_REPORT_SIZE DT_PROP(TP_NODE, mouse_input_report_size)
-#define TP_PTP_INPUT_REPORT_SIZE  DT_PROP(TP_NODE, ptp_input_report_size)
+#define I2C_HID_MOUSE_INPUT_REPORT_ID  DT_PROP(I2C_HID_NODE, mouse_input_report_id)
+#define I2C_HID_PTP_INPUT_REPORT_ID    DT_PROP(I2C_HID_NODE, ptp_input_report_id)
+#define I2C_HID_MOUSE_INPUT_REPORT_SIZE DT_PROP(I2C_HID_NODE, mouse_input_report_size)
+#define I2C_HID_PTP_INPUT_REPORT_SIZE  DT_PROP(I2C_HID_NODE, ptp_input_report_size)
 
 enum {
     HIDS_REMOTE_WAKE = BIT(0),
@@ -44,28 +44,28 @@ enum {
     HIDS_FEATURE = 0x03,
 };
 
-static struct hids_info tp_info = {
+static struct hids_info hid_info = {
     .version = 0x0000,
     .code = 0x00,
     .flags = HIDS_NORMALLY_CONNECTABLE | HIDS_REMOTE_WAKE,
 };
 
 /* Report reference descriptors for input reports */
-static struct hids_report mouse_input_ref = { .id = TP_MOUSE_INPUT_REPORT_ID, .type = HIDS_INPUT };
-static struct hids_report ptp_input_ref = { .id = TP_PTP_INPUT_REPORT_ID, .type = HIDS_INPUT };
+static struct hids_report mouse_input_ref = { .id = I2C_HID_MOUSE_INPUT_REPORT_ID, .type = HIDS_INPUT };
+static struct hids_report ptp_input_ref = { .id = I2C_HID_PTP_INPUT_REPORT_ID, .type = HIDS_INPUT };
 
 /* Generate feature report reference descriptors from devicetree */
 #define FEATURE_REF_DECL(node, prop, idx) \
     static struct hids_report feature_ref_##idx = { \
         .id = DT_PROP_BY_IDX(node, prop, idx), .type = HIDS_FEATURE };
-DT_FOREACH_PROP_ELEM(TP_NODE, feature_report_ids, FEATURE_REF_DECL)
+DT_FOREACH_PROP_ELEM(I2C_HID_NODE, feature_report_ids, FEATURE_REF_DECL)
 
 static uint8_t ctrl_point;
-static const struct device *tp_dev;
+static const struct device *i2c_hid_dev;
 
 /* Cached last input reports for BLE read */
-static uint8_t cached_mouse_report[TP_MOUSE_INPUT_REPORT_SIZE];
-static uint8_t cached_ptp_report[TP_PTP_INPUT_REPORT_SIZE];
+static uint8_t cached_mouse_report[I2C_HID_MOUSE_INPUT_REPORT_SIZE];
+static uint8_t cached_ptp_report[I2C_HID_PTP_INPUT_REPORT_SIZE];
 
 /* ---- GATT read/write callbacks ---- */
 
@@ -83,8 +83,8 @@ static ssize_t read_hids_report_ref(struct bt_conn *conn, const struct bt_gatt_a
 
 static ssize_t read_hids_report_map(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                      void *buf, uint16_t len, uint16_t offset) {
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, tp_report_desc,
-                             tp_report_desc_size);
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, i2c_hid_report_desc,
+                             i2c_hid_report_desc_size);
 }
 
 static ssize_t read_mouse_input_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -102,15 +102,15 @@ static ssize_t read_ptp_input_report(struct bt_conn *conn, const struct bt_gatt_
 static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                     void *buf, uint16_t len, uint16_t offset) {
     struct hids_report *ref = (struct hids_report *)attr->user_data;
-    if (!ref || !tp_dev) {
+    if (!ref || !i2c_hid_dev) {
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
 
     static uint8_t feature_buf[264];
     uint16_t out_len = 0;
 
-    int err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
-                                      feature_buf, sizeof(feature_buf), &out_len);
+    int err = i2c_hid_get_report(i2c_hid_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
+                                  feature_buf, sizeof(feature_buf), &out_len);
     if (err) {
         LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
@@ -123,11 +123,11 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
                                      const void *buf, uint16_t len, uint16_t offset,
                                      uint8_t flags) {
     struct hids_report *ref = (struct hids_report *)attr->user_data;
-    if (!ref || !tp_dev || offset != 0) {
+    if (!ref || !i2c_hid_dev || offset != 0) {
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
 
-    int err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
+    int err = i2c_hid_set_report(i2c_hid_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
     if (err) {
         LOG_ERR("BLE set feature report %d failed: %d", ref->id, err);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
@@ -136,8 +136,8 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
     return len;
 }
 
-static void tp_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
-    LOG_DBG("TP CCC changed: %d", value);
+static void hid_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
+    LOG_DBG("HID CCC changed: %d", value);
 }
 
 static ssize_t write_ctrl_point(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -160,16 +160,16 @@ static ssize_t write_ctrl_point(struct bt_conn *conn, const struct bt_gatt_attr 
                        read_hids_report_ref, NULL, &feature_ref_##idx),
 
 /* Attribute indices for notify targets (stable: precede variable-length feature section) */
-#define TP_MOUSE_INPUT_ATTR_IDX  6
-#define TP_PTP_INPUT_ATTR_IDX   10
+#define HID_MOUSE_INPUT_ATTR_IDX  6
+#define HID_PTP_INPUT_ATTR_IDX   10
 
 BT_GATT_SERVICE_DEFINE(
-    tp_hog_svc,
+    hid_passthrough_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_HIDS),
 
     /* HID Info */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_INFO, BT_GATT_CHRC_READ,
-                           BT_GATT_PERM_READ, read_hids_info, NULL, &tp_info),
+                           BT_GATT_PERM_READ, read_hids_info, NULL, &hid_info),
 
     /* Report Map */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT_MAP, BT_GATT_CHRC_READ,
@@ -178,36 +178,36 @@ BT_GATT_SERVICE_DEFINE(
     /* Input Report: Mouse */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_READ_ENCRYPT, read_mouse_input_report, NULL, NULL),
-    BT_GATT_CCC(tp_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+    BT_GATT_CCC(hid_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
     BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
                        read_hids_report_ref, NULL, &mouse_input_ref),
 
     /* Input Report: PTP multitouch */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_READ_ENCRYPT, read_ptp_input_report, NULL, NULL),
-    BT_GATT_CCC(tp_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+    BT_GATT_CCC(hid_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
     BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT,
                        read_hids_report_ref, NULL, &ptp_input_ref),
 
     /* Feature reports (generated from devicetree) */
-    DT_FOREACH_PROP_ELEM(TP_NODE, feature_report_ids, FEATURE_GATT_ATTRS)
+    DT_FOREACH_PROP_ELEM(I2C_HID_NODE, feature_report_ids, FEATURE_GATT_ATTRS)
 
     /* HID Control Point */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
 
 /* Work queue for BLE notifications */
-K_THREAD_STACK_DEFINE(tp_hog_q_stack, 768);
-static struct k_work_q tp_hog_work_q;
+K_THREAD_STACK_DEFINE(hid_pt_q_stack, 768);
+static struct k_work_q hid_pt_work_q;
 
 /* Message queue entry: report_id + data */
-struct tp_report_msg {
+struct hid_report_msg {
     uint8_t report_id;
-    uint8_t data[MAX(TP_MOUSE_INPUT_REPORT_SIZE, TP_PTP_INPUT_REPORT_SIZE)];
+    uint8_t data[MAX(I2C_HID_MOUSE_INPUT_REPORT_SIZE, I2C_HID_PTP_INPUT_REPORT_SIZE)];
     uint16_t len;
 };
 
-K_MSGQ_DEFINE(tp_report_msgq, sizeof(struct tp_report_msg), 8, 4);
+K_MSGQ_DEFINE(hid_report_msgq, sizeof(struct hid_report_msg), 8, 4);
 
 struct conn_collect_ctx {
     struct bt_conn *conns[CONFIG_BT_MAX_CONN];
@@ -222,20 +222,20 @@ static void collect_conn_cb(struct bt_conn *conn, void *user_data) {
     }
 }
 
-static void send_tp_report_callback(struct k_work *work) {
-    struct tp_report_msg msg;
+static void send_hid_report_callback(struct k_work *work) {
+    struct hid_report_msg msg;
 
-    while (k_msgq_get(&tp_report_msgq, &msg, K_NO_WAIT) == 0) {
+    while (k_msgq_get(&hid_report_msgq, &msg, K_NO_WAIT) == 0) {
         struct conn_collect_ctx ctx = { .count = 0 };
         bt_conn_foreach(BT_CONN_TYPE_LE, collect_conn_cb, &ctx);
 
         const struct bt_gatt_attr *attr;
-        if (msg.report_id == TP_MOUSE_INPUT_REPORT_ID) {
-            attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
+        if (msg.report_id == I2C_HID_MOUSE_INPUT_REPORT_ID) {
+            attr = &hid_passthrough_svc.attrs[HID_MOUSE_INPUT_ATTR_IDX];
             memcpy(cached_mouse_report, msg.data,
                    MIN(msg.len, sizeof(cached_mouse_report)));
-        } else if (msg.report_id == TP_PTP_INPUT_REPORT_ID) {
-            attr = &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
+        } else if (msg.report_id == I2C_HID_PTP_INPUT_REPORT_ID) {
+            attr = &hid_passthrough_svc.attrs[HID_PTP_INPUT_ATTR_IDX];
             memcpy(cached_ptp_report, msg.data,
                    MIN(msg.len, sizeof(cached_ptp_report)));
         } else {
@@ -263,43 +263,43 @@ static void send_tp_report_callback(struct k_work *work) {
     }
 }
 
-K_WORK_DEFINE(tp_hog_work, send_tp_report_callback);
+K_WORK_DEFINE(hid_pt_work, send_hid_report_callback);
 
-static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
-                             const uint8_t *data, uint16_t len) {
+static void hid_ble_input_cb(const struct device *dev, uint8_t report_id,
+                               const uint8_t *data, uint16_t len) {
     /* Only forward input reports (mouse and PTP) */
-    if (report_id != TP_MOUSE_INPUT_REPORT_ID && report_id != TP_PTP_INPUT_REPORT_ID) {
+    if (report_id != I2C_HID_MOUSE_INPUT_REPORT_ID && report_id != I2C_HID_PTP_INPUT_REPORT_ID) {
         return;
     }
 
-    struct tp_report_msg msg;
+    struct hid_report_msg msg;
     msg.report_id = report_id;
     msg.len = MIN(len, sizeof(msg.data));
     memcpy(msg.data, data, msg.len);
 
-    int err = k_msgq_put(&tp_report_msgq, &msg, K_NO_WAIT);
+    int err = k_msgq_put(&hid_report_msgq, &msg, K_NO_WAIT);
     if (err) {
-        LOG_WRN("TP report queue full, dropping report ID %d", report_id);
+        LOG_WRN("HID report queue full, dropping report ID %d", report_id);
         return;
     }
 
-    k_work_submit_to_queue(&tp_hog_work_q, &tp_hog_work);
+    k_work_submit_to_queue(&hid_pt_work_q, &hid_pt_work);
 }
 
 static int hid_passthrough_ble_init(void) {
-    tp_dev = DEVICE_DT_GET(TP_NODE);
-    if (!device_is_ready(tp_dev)) {
-        LOG_ERR("Touchpad device not ready");
+    i2c_hid_dev = DEVICE_DT_GET(I2C_HID_NODE);
+    if (!device_is_ready(i2c_hid_dev)) {
+        LOG_ERR("I2C HID device not ready");
         return -ENODEV;
     }
 
     static const struct k_work_queue_config queue_config = {
-        .name = "TP HOG Send Work"
+        .name = "HID PT Send Work"
     };
-    k_work_queue_start(&tp_hog_work_q, tp_hog_q_stack,
-                       K_THREAD_STACK_SIZEOF(tp_hog_q_stack), 5, &queue_config);
+    k_work_queue_start(&hid_pt_work_q, hid_pt_q_stack,
+                       K_THREAD_STACK_SIZEOF(hid_pt_q_stack), 5, &queue_config);
 
-    hid_touchpad_register_input_cb(tp_dev, tp_ble_input_cb);
+    i2c_hid_register_input_cb(i2c_hid_dev, hid_ble_input_cb);
 
     LOG_INF("BLE HID passthrough initialized");
     return 0;

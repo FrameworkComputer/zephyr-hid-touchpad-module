@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define DT_DRV_COMPAT zmk_hid_touchpad
+#define DT_DRV_COMPAT zmk_i2c_hid
 
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
@@ -14,19 +14,19 @@
 #include <zephyr/init.h>
 #include <zephyr/pm/device.h>
 
-#include "hid_touchpad.h"
+#include "i2c_hid.h"
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(hid_touchpad, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
+LOG_MODULE_REGISTER(i2c_hid, CONFIG_I2C_HID_LOG_LEVEL);
 
 /* HID report descriptor from devicetree */
-const uint8_t tp_report_desc[] = DT_INST_PROP(0, report_descriptor);
-const size_t tp_report_desc_size = DT_INST_PROP_LEN(0, report_descriptor);
+const uint8_t i2c_hid_report_desc[] = DT_INST_PROP(0, report_descriptor);
+const size_t i2c_hid_report_desc_size = DT_INST_PROP_LEN(0, report_descriptor);
 
-int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
-                            uint8_t *buf, uint16_t buf_len, uint16_t *out_len) {
-    struct hid_touchpad_data *data = dev->data;
-    const struct hid_touchpad_config *config = dev->config;
+int i2c_hid_get_report(const struct device *dev, uint8_t type, uint8_t id,
+                        uint8_t *buf, uint16_t buf_len, uint16_t *out_len) {
+    struct i2c_hid_data *data = dev->data;
+    const struct i2c_hid_config *config = dev->config;
 
     uint8_t cmd[6];
     if (id <= 0x0F) {
@@ -81,10 +81,10 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
     return 0;
 }
 
-int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
-                            const uint8_t *report_data, uint16_t len) {
-    struct hid_touchpad_data *data = dev->data;
-    const struct hid_touchpad_config *config = dev->config;
+int i2c_hid_set_report(const struct device *dev, uint8_t type, uint8_t id,
+                        const uint8_t *report_data, uint16_t len) {
+    struct i2c_hid_data *data = dev->data;
+    const struct i2c_hid_config *config = dev->config;
 
     /* Wire format: [data_reg, 0x00, len_lo, len_hi, report_id, data...] */
 
@@ -140,18 +140,18 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
     }
 }
 
-void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb) {
-    struct hid_touchpad_data *data = dev->data;
-    if (data->num_cbs < HID_TOUCHPAD_MAX_CBS) {
+void i2c_hid_register_input_cb(const struct device *dev, i2c_hid_input_cb_t cb) {
+    struct i2c_hid_data *data = dev->data;
+    if (data->num_cbs < I2C_HID_MAX_CBS) {
         data->input_cbs[data->num_cbs++] = cb;
     } else {
         LOG_ERR("Too many input callbacks registered");
     }
 }
 
-static void hid_touchpad_report_data(const struct device *dev) {
-    struct hid_touchpad_data *data = dev->data;
-    const struct hid_touchpad_config *config = dev->config;
+static void i2c_hid_report_data(const struct device *dev) {
+    struct i2c_hid_data *data = dev->data;
+    const struct i2c_hid_config *config = dev->config;
 
     int err = i2c_read_dt(&config->i2c_bus, data->report_buf, data->max_input_len);
     if (err) {
@@ -188,7 +188,7 @@ static void hid_touchpad_report_data(const struct device *dev) {
 }
 
 static int set_int(const struct device *dev, const bool en) {
-    const struct hid_touchpad_config *config = dev->config;
+    const struct i2c_hid_config *config = dev->config;
     int ret = gpio_pin_interrupt_configure_dt(&config->dr,
                                               en ? GPIO_INT_EDGE_TO_ACTIVE : GPIO_INT_DISABLE);
     if (ret < 0) {
@@ -197,20 +197,20 @@ static int set_int(const struct device *dev, const bool en) {
     return ret;
 }
 
-static void hid_touchpad_work_cb(struct k_work *work) {
-    struct hid_touchpad_data *data = CONTAINER_OF(work, struct hid_touchpad_data, work);
-    hid_touchpad_report_data(data->dev);
+static void i2c_hid_work_cb(struct k_work *work) {
+    struct i2c_hid_data *data = CONTAINER_OF(work, struct i2c_hid_data, work);
+    i2c_hid_report_data(data->dev);
 }
 
-static void hid_touchpad_gpio_cb(const struct device *port, struct gpio_callback *cb,
-                                  uint32_t pins) {
-    struct hid_touchpad_data *data = CONTAINER_OF(cb, struct hid_touchpad_data, gpio_cb);
+static void i2c_hid_gpio_cb(const struct device *port, struct gpio_callback *cb,
+                              uint32_t pins) {
+    struct i2c_hid_data *data = CONTAINER_OF(cb, struct i2c_hid_data, gpio_cb);
     k_work_submit(&data->work);
 }
 
-static int hid_touchpad_init(const struct device *dev) {
-    struct hid_touchpad_data *data = dev->data;
-    const struct hid_touchpad_config *config = dev->config;
+static int i2c_hid_init(const struct device *dev) {
+    struct i2c_hid_data *data = dev->data;
+    const struct i2c_hid_config *config = dev->config;
 
     if (!device_is_ready(config->i2c_bus.bus)) {
         LOG_WRN("i2c bus not ready!");
@@ -256,12 +256,10 @@ static int hid_touchpad_init(const struct device *dev) {
     LOG_INF("command_reg=0x%02x data_reg=0x%02x input_reg=0x%04x max_input_len=%d",
             data->command_reg, data->data_reg, data->input_reg, data->max_input_len);
 
-    /* Do NOT disable PTP — let the OS control input mode via feature reports */
-
     data->dev = dev;
 
     gpio_pin_configure_dt(&config->dr, GPIO_INPUT);
-    gpio_init_callback(&data->gpio_cb, hid_touchpad_gpio_cb, BIT(config->dr.pin));
+    gpio_init_callback(&data->gpio_cb, i2c_hid_gpio_cb, BIT(config->dr.pin));
     int ret = gpio_add_callback(config->dr.port, &data->gpio_cb);
     if (ret < 0) {
         LOG_ERR("Failed to set DR callback: %d", ret);
@@ -270,16 +268,16 @@ static int hid_touchpad_init(const struct device *dev) {
 
     set_int(dev, true);
 
-    k_work_init(&data->work, hid_touchpad_work_cb);
+    k_work_init(&data->work, i2c_hid_work_cb);
 
-    LOG_INF("HID touchpad passthrough initialized at 0x%x", config->i2c_bus.addr);
+    LOG_INF("I2C HID device passthrough initialized at 0x%x", config->i2c_bus.addr);
 
     return 0;
 }
 
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
-static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_action action) {
+static int i2c_hid_pm_action(const struct device *dev, enum pm_device_action action) {
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
         return set_int(dev, false);
@@ -292,16 +290,16 @@ static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_actio
 
 #endif /* IS_ENABLED(CONFIG_PM_DEVICE) */
 
-#define HID_TOUCHPAD_INIT(n)                                                                      \
-    static struct hid_touchpad_data hid_touchpad_data_##n;                                        \
-    static const struct hid_touchpad_config hid_touchpad_config_##n = {                           \
-        .i2c_bus = I2C_DT_SPEC_INST_GET(n),                                                      \
-        .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                 \
-        .hid_desc_register = DT_INST_PROP(n, hid_descriptor_register),                            \
-    };                                                                                            \
-    PM_DEVICE_DT_INST_DEFINE(n, hid_touchpad_pm_action);                                          \
-    DEVICE_DT_INST_DEFINE(n, hid_touchpad_init, PM_DEVICE_DT_INST_GET(n),                         \
-                          &hid_touchpad_data_##n, &hid_touchpad_config_##n,                       \
+#define I2C_HID_INIT(n)                                                                           \
+    static struct i2c_hid_data i2c_hid_data_##n;                                                  \
+    static const struct i2c_hid_config i2c_hid_config_##n = {                                     \
+        .i2c_bus = I2C_DT_SPEC_INST_GET(n),                                                       \
+        .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                  \
+        .hid_desc_register = DT_INST_PROP(n, hid_descriptor_register),                             \
+    };                                                                                             \
+    PM_DEVICE_DT_INST_DEFINE(n, i2c_hid_pm_action);                                               \
+    DEVICE_DT_INST_DEFINE(n, i2c_hid_init, PM_DEVICE_DT_INST_GET(n),                              \
+                          &i2c_hid_data_##n, &i2c_hid_config_##n,                                  \
                           POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY, NULL);
 
-DT_INST_FOREACH_STATUS_OKAY(HID_TOUCHPAD_INIT)
+DT_INST_FOREACH_STATUS_OKAY(I2C_HID_INIT)

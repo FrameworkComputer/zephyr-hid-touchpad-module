@@ -5,17 +5,17 @@
 #
 
 description: >
-  I2C HID Touchpad passthrough driver. Forwards raw HID reports from an
-  I2C HID touchpad to USB and BLE host interfaces.
+  I2C HID device passthrough driver. Forwards raw HID reports from an
+  I2C HID device to USB and BLE host interfaces.
 
-compatible: "zmk,hid-touchpad"
+compatible: "zmk,i2c-hid"
 
 include: [i2c-device.yaml]
 
 properties:
   dr-gpios:
     type: phandle-array
-    description: Interrupt (data ready) pin for the touchpad
+    description: Interrupt (data ready) pin for the I2C HID device
 
   hid-descriptor-register:
     type: int
@@ -50,4 +50,4 @@ properties:
   feature-report-ids:
     type: array
     required: true
-    description: List of feature report IDs exposed by this touchpad
+    description: List of feature report IDs exposed by this device

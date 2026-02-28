@@ -9,7 +9,7 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/usb/class/usb_hid.h>
 
-#include "hid_touchpad.h"
+#include "i2c_hid.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
@@ -22,7 +22,7 @@ LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
 #define HID_REPORT_TYPE_FEATURE 0x0300
 
 static const struct device *hid_dev;
-static const struct device *tp_dev;
+static const struct device *i2c_hid_dev;
 
 static K_SEM_DEFINE(hid_sem, 1, 1);
 
@@ -54,8 +54,8 @@ static int get_report_cb(const struct device *dev, struct usb_setup_packet *setu
     uint16_t out_len = 0;
 
     report_buf[0] = report_id;
-    int err = hid_touchpad_get_report(tp_dev, i2c_type, report_id,
-                                      report_buf + 1, sizeof(report_buf) - 1, &out_len);
+    int err = i2c_hid_get_report(i2c_hid_dev, i2c_type, report_id,
+                                  report_buf + 1, sizeof(report_buf) - 1, &out_len);
     if (err) {
         LOG_ERR("get_report proxy failed for type=0x%02x id=%d: %d", i2c_type, report_id, err);
         return err;
@@ -85,9 +85,9 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
     }
 
     /* Zephyr USB HID includes the report ID as the first byte of *data.
-     * Skip it — hid_touchpad_set_report adds the report ID itself. */
-    int err = hid_touchpad_set_report(tp_dev, i2c_type, report_id,
-                                      *data + 1, *len - 1);
+     * Skip it — i2c_hid_set_report adds the report ID itself. */
+    int err = i2c_hid_set_report(i2c_hid_dev, i2c_type, report_id,
+                                  *data + 1, *len - 1);
     if (err) {
         LOG_ERR("set_report proxy failed for type=0x%02x id=%d: %d", i2c_type, report_id, err);
         return err;
@@ -96,8 +96,8 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
     return 0;
 }
 
-static void tp_input_cb(const struct device *dev, uint8_t report_id,
-                         const uint8_t *data, uint16_t len) {
+static void usb_input_cb(const struct device *dev, uint8_t report_id,
+                           const uint8_t *data, uint16_t len) {
     if (!hid_dev) {
         return;
     }
@@ -126,9 +126,9 @@ static const struct hid_ops ops = {
 };
 
 static int hid_passthrough_usb_init(void) {
-    tp_dev = DEVICE_DT_GET(DT_NODELABEL(touchpad));
-    if (!device_is_ready(tp_dev)) {
-        LOG_ERR("Touchpad device not ready");
+    i2c_hid_dev = DEVICE_DT_GET(DT_NODELABEL(i2c_hid));
+    if (!device_is_ready(i2c_hid_dev)) {
+        LOG_ERR("I2C HID device not ready");
         return -ENODEV;
     }
 
@@ -138,10 +138,10 @@ static int hid_passthrough_usb_init(void) {
         return -EINVAL;
     }
 
-    usb_hid_register_device(hid_dev, tp_report_desc, tp_report_desc_size, &ops);
+    usb_hid_register_device(hid_dev, i2c_hid_report_desc, i2c_hid_report_desc_size, &ops);
     usb_hid_init(hid_dev);
 
-    hid_touchpad_register_input_cb(tp_dev, tp_input_cb);
+    i2c_hid_register_input_cb(i2c_hid_dev, usb_input_cb);
 
     LOG_INF("USB HID passthrough initialized on HID_1");
     return 0;
