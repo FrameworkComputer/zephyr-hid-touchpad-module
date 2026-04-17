@@ -18,10 +18,21 @@ config INPUT_HID_TOUCHPAD_INIT_PRIORITY
 
 config HID_PASSTHROUGH_USB
     bool "USB HID Passthrough for touchpad"
-    depends on USB_DEVICE_HID
+    depends on USB_DEVICE_HID || USBD_HID_SUPPORT
     default y
     help
-      Enable USB HID passthrough for the touchpad on HID_1.
+      Enable USB HID passthrough for the touchpad. Works with either the
+      legacy USB device stack (CONFIG_USB_DEVICE_HID) or the new stack
+      (CONFIG_USBD_HID_SUPPORT); the correct source file is selected
+      automatically based on which stack is enabled.
+
+config HID_PASSTHROUGH_USB_LEGACY
+    def_bool y
+    depends on HID_PASSTHROUGH_USB && USB_DEVICE_HID
+
+config HID_PASSTHROUGH_USB_NEXT
+    def_bool y
+    depends on HID_PASSTHROUGH_USB && USBD_HID_SUPPORT
 
 config HID_PASSTHROUGH_BLE
     bool "BLE HID Passthrough for touchpad"

@@ -1,0 +1,137 @@
+/*
+ * Copyright (c) 2026 The ZMK Contributors
+ * Copyright (c) 2026 Framework Computer Inc
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <zephyr/device.h>
+#include <zephyr/init.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/usb/usbd.h>
+#include <zephyr/usb/class/usbd_hid.h>
+
+#include "hid_touchpad.h"
+
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
+
+#define TP_HID_NODE DT_NODELABEL(tp_hid)
+
+BUILD_ASSERT(DT_NODE_EXISTS(TP_HID_NODE),
+             "Node label 'tp_hid' missing; add a zephyr,hid-device node to the shield/board DT");
+
+static const struct device *const hid_dev = DEVICE_DT_GET(TP_HID_NODE);
+static const struct device *tp_dev;
+static bool hid_ready;
+
+static void iface_ready_cb(const struct device *dev, const bool ready) {
+    LOG_INF("TP HID interface %s", ready ? "ready" : "not ready");
+    hid_ready = ready;
+}
+
+static int get_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+                         const uint16_t len, uint8_t *const buf) {
+    uint8_t i2c_type;
+
+    LOG_DBG("get_report: type=%u id=0x%02x len=%u", type, id, len);
+
+    switch (type) {
+    case HID_REPORT_TYPE_FEATURE:
+        i2c_type = I2C_HID_REPORT_TYPE_FEATURE;
+        break;
+    case HID_REPORT_TYPE_INPUT:
+        i2c_type = I2C_HID_REPORT_TYPE_INPUT;
+        break;
+    default:
+        return -ENOTSUP;
+    }
+
+    uint16_t out_len = 0;
+    int err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf, len, &out_len);
+    if (err) {
+        LOG_ERR("get_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
+        return err;
+    }
+    return (int)out_len;
+}
+
+static int set_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+                         const uint16_t len, const uint8_t *const buf) {
+    uint8_t i2c_type;
+
+    LOG_DBG("set_report: type=%u id=0x%02x len=%u", type, id, len);
+
+    switch (type) {
+    case HID_REPORT_TYPE_FEATURE:
+        i2c_type = I2C_HID_REPORT_TYPE_FEATURE;
+        break;
+    case HID_REPORT_TYPE_OUTPUT:
+        i2c_type = I2C_HID_REPORT_TYPE_OUTPUT;
+        break;
+    default:
+        return -ENOTSUP;
+    }
+
+    int err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf, len);
+    if (err) {
+        LOG_ERR("set_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
+    }
+    return err;
+}
+
+static const struct hid_device_ops ops = {
+    .iface_ready = iface_ready_cb,
+    .get_report = get_report_cb,
+    .set_report = set_report_cb,
+};
+
+static void tp_input_cb(const struct device *dev, uint8_t report_id,
+                        const uint8_t *data, uint16_t len) {
+    if (!hid_ready) {
+        return;
+    }
+
+    /* hid_device_submit_report() expects the report ID as the first byte. */
+    uint8_t buf[64];
+    if ((size_t)len + 1 > sizeof(buf)) {
+        LOG_WRN("input report too large: %u", len);
+        return;
+    }
+    buf[0] = report_id;
+    memcpy(&buf[1], data, len);
+
+    int err = hid_device_submit_report(hid_dev, len + 1, buf);
+    if (err) {
+        LOG_DBG("submit_report failed: %d", err);
+    }
+}
+
+static int hid_passthrough_usb_init(void) {
+    tp_dev = DEVICE_DT_GET(DT_NODELABEL(touchpad));
+    if (!device_is_ready(tp_dev)) {
+        LOG_ERR("Touchpad device not ready");
+        return -ENODEV;
+    }
+
+    if (!device_is_ready(hid_dev)) {
+        LOG_ERR("TP HID device not ready");
+        return -ENODEV;
+    }
+
+    int err = hid_device_register(hid_dev, tp_report_desc, tp_report_desc_size, &ops);
+    if (err) {
+        LOG_ERR("hid_device_register failed: %d", err);
+        return err;
+    }
+
+    hid_touchpad_register_input_cb(tp_dev, tp_input_cb);
+
+    LOG_INF("USB HID touchpad passthrough (next stack) initialized");
+    return 0;
+}
+
+/* Must run before zmk_usb_init (APPLICATION/ZMK_USB_INIT_PRIORITY=96),
+ * since hid_device_register must happen before usbd_register_all_classes. */
+SYS_INIT(hid_passthrough_usb_init, APPLICATION, 95);
