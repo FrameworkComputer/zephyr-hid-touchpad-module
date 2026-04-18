@@ -37,6 +37,10 @@ static int get_report_cb(const struct device *dev, const uint8_t type, const uin
 
     LOG_DBG("get_report: type=%u id=0x%02x len=%u", type, id, len);
 
+    if (tp_dev == NULL || !device_is_ready(tp_dev)) {
+        return -ENOTSUP;
+    }
+
     switch (type) {
     case HID_REPORT_TYPE_FEATURE:
         i2c_type = I2C_HID_REPORT_TYPE_FEATURE;
@@ -62,6 +66,10 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
     uint8_t i2c_type;
 
     LOG_DBG("set_report: type=%u id=0x%02x len=%u", type, id, len);
+
+    if (tp_dev == NULL || !device_is_ready(tp_dev)) {
+        return -ENOTSUP;
+    }
 
     switch (type) {
     case HID_REPORT_TYPE_FEATURE:
@@ -109,21 +117,25 @@ static void tp_input_cb(const struct device *dev, uint8_t report_id,
 }
 
 static int hid_passthrough_usb_init(void) {
-    tp_dev = DEVICE_DT_GET(DT_NODELABEL(touchpad));
-    if (!device_is_ready(tp_dev)) {
-        LOG_ERR("Touchpad device not ready");
-        return -ENODEV;
-    }
-
     if (!device_is_ready(hid_dev)) {
         LOG_ERR("TP HID device not ready");
         return -ENODEV;
     }
 
+    /* Register the HID class unconditionally so the new USBD stack can
+     * initialize its interface, even if the physical touchpad isn't
+     * present or failed to init. Without this, usbd_register_all_classes()
+     * refuses to bring up ANY interface (including the keyboard HID). */
     int err = hid_device_register(hid_dev, tp_report_desc, tp_report_desc_size, &ops);
     if (err) {
         LOG_ERR("hid_device_register failed: %d", err);
         return err;
+    }
+
+    tp_dev = DEVICE_DT_GET(DT_NODELABEL(touchpad));
+    if (!device_is_ready(tp_dev)) {
+        LOG_WRN("Touchpad device not ready; passthrough will stay idle");
+        return 0;
     }
 
     hid_touchpad_register_input_cb(tp_dev, tp_input_cb);
