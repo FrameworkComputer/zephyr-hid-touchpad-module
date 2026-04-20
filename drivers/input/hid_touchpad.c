@@ -222,9 +222,19 @@ static int hid_touchpad_init(const struct device *dev) {
         LOG_WRN("I2C bus recovery failed or not supported: %d", err);
     }
 
-    /* Read 30-byte I2C HID descriptor from configured register */
+    /* Read 30-byte I2C HID descriptor from configured register. Retry with
+     * delay because an external enable rail may still be ramping or the
+     * panel firmware may still be booting during POST_KERNEL — external
+     * startup-delay can't be relied on across init-priority boundaries. */
     uint8_t hid_desc[30] = {0};
-    err = i2c_burst_read_dt(&config->i2c_bus, config->hid_desc_register, hid_desc, sizeof(hid_desc));
+    err = -EIO;
+    for (int attempt = 0; attempt < 10 && err != 0; attempt++) {
+        if (attempt > 0) {
+            k_msleep(100);
+        }
+        err = i2c_burst_read_dt(&config->i2c_bus, config->hid_desc_register,
+                                hid_desc, sizeof(hid_desc));
+    }
     if (err) {
         LOG_ERR("Failed to read HID descriptor: %d", err);
         return -ENODEV;
