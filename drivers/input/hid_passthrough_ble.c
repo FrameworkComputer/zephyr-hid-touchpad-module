@@ -150,10 +150,13 @@ static ssize_t write_ctrl_point(struct bt_conn *conn, const struct bt_gatt_attr 
     return len;
 }
 
-/* Macro to generate GATT feature report attributes from devicetree */
+/* Per HoGP 1.0 Table 4.3, Feature Report characteristics advertise only
+ * Read + Write. Advertising Write-Without-Response makes BlueZ classify the
+ * characteristic as an Output Report, which silently suppresses feature
+ * GET_REPORT requests (no ATT read is ever issued to us). */
 #define FEATURE_GATT_ATTRS(node, prop, idx) \
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, \
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP, \
+                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE, \
                            BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT, \
                            read_feature_report, write_feature_report, &feature_ref_##idx), \
     BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT, \
