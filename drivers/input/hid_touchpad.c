@@ -28,7 +28,15 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
-    uint8_t cmd[6];
+    /* I2C HID frames responses as [len_lo, len_hi, report_id, data...].
+     * The caller's buf is sized for the unframed payload only (e.g. USB
+     * passes wLength from the host), so do the I2C transfer into a local
+     * buffer and copy only the data portion out. Max feature report in our
+     * descriptor is 256 bytes; add 3 bytes of framing plus slack. */
+    uint8_t i2c_buf[264];
+
+    uint8_t cmd[7];
+    size_t cmd_len;
     if (id <= 0x0F) {
         cmd[0] = data->command_reg;
         cmd[1] = 0x00;
@@ -36,48 +44,36 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
         cmd[3] = I2C_HID_GET_REPORT;
         cmd[4] = data->data_reg;
         cmd[5] = 0x00;
+        cmd_len = 6;
     } else {
-        /* For report IDs > 15, use the extended format */
-        uint8_t cmd_ext[7] = {
-            data->command_reg, 0x00,
-            type | 0x0F, I2C_HID_GET_REPORT,
-            id,
-            data->data_reg, 0x00,
-        };
-        int err = i2c_write_read_dt(&config->i2c_bus, cmd_ext, sizeof(cmd_ext),
-                                     buf, buf_len);
-        if (err) {
-            LOG_ERR("get_report (ext) failed: %d", err);
-            return err;
-        }
-        LOG_HEXDUMP_DBG(cmd_ext, sizeof(cmd_ext), "get_report ext cmd");
-        LOG_HEXDUMP_DBG(buf, MIN(16, buf_len), "get_report ext raw resp");
-        uint16_t len = sys_get_le16(buf);
-        if (len < 3 || len > buf_len) {
-            LOG_ERR("get_report (ext) invalid length: %d", len);
-            return -EINVAL;
-        }
-        /* buf[0..1] = length, buf[2] = report ID, buf[3..] = data */
-        *out_len = len - 3;
-        /* Shift data to start of buffer: data starts at buf[3] */
-        memmove(buf, &buf[3], *out_len);
-        return 0;
+        cmd[0] = data->command_reg;
+        cmd[1] = 0x00;
+        cmd[2] = type | 0x0F;
+        cmd[3] = I2C_HID_GET_REPORT;
+        cmd[4] = id;
+        cmd[5] = data->data_reg;
+        cmd[6] = 0x00;
+        cmd_len = 7;
     }
 
-    int err = i2c_write_read_dt(&config->i2c_bus, cmd, sizeof(cmd), buf, buf_len);
+    int err = i2c_write_read_dt(&config->i2c_bus, cmd, cmd_len,
+                                 i2c_buf, sizeof(i2c_buf));
     if (err) {
-        LOG_ERR("get_report failed: %d", err);
+        LOG_ERR("get_report id=%u failed: %d", id, err);
         return err;
     }
 
-    uint16_t len = sys_get_le16(buf);
-    if (len < 3 || len > buf_len) {
-        LOG_ERR("get_report invalid length: %d", len);
+    uint16_t frame_len = sys_get_le16(i2c_buf);
+    if (frame_len < 3 || frame_len > sizeof(i2c_buf)) {
+        LOG_ERR("get_report id=%u invalid frame length: %u", id, frame_len);
         return -EINVAL;
     }
-    /* buf[0..1] = length, buf[2] = report ID, buf[3..] = data */
-    *out_len = len - 3;
-    memmove(buf, &buf[3], *out_len);
+
+    /* i2c_buf[0..1] = length, i2c_buf[2] = report ID, i2c_buf[3..] = data */
+    uint16_t data_len = frame_len - 3;
+    uint16_t copy_len = MIN(data_len, buf_len);
+    memcpy(buf, &i2c_buf[3], copy_len);
+    *out_len = copy_len;
     return 0;
 }
 
