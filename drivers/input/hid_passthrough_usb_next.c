@@ -52,13 +52,21 @@ static int get_report_cb(const struct device *dev, const uint8_t type, const uin
         return -ENOTSUP;
     }
 
+    /* When report IDs are in use, USB HID (and Linux hid-core in particular)
+     * expects the returned data to begin with the report ID byte. Place it
+     * at buf[0] and ask the touchpad for its data starting at buf[1]. */
+    if (len < 1) {
+        return -EINVAL;
+    }
+    buf[0] = id;
+
     uint16_t out_len = 0;
-    int err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf, len, &out_len);
+    int err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf + 1, len - 1, &out_len);
     if (err) {
         LOG_ERR("get_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
         return err;
     }
-    return (int)out_len;
+    return (int)out_len + 1;
 }
 
 static int set_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
