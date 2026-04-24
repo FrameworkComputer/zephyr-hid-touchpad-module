@@ -90,7 +90,13 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
         return -ENOTSUP;
     }
 
-    int err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf, len);
+    /* Linux (and per the HID spec) sends SET_REPORT for numbered reports
+     * with the report ID as the first data byte, so buf[0] == id. Skip it:
+     * hid_touchpad_set_report frames its own I2C HID payload including id. */
+    if (len < 1) {
+        return -EINVAL;
+    }
+    int err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf + 1, len - 1);
     if (err) {
         LOG_ERR("set_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
     }
