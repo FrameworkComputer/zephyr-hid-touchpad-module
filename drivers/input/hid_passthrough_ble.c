@@ -103,8 +103,11 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
                                     void *buf, uint16_t len, uint16_t offset) {
     struct hids_report *ref = (struct hids_report *)attr->user_data;
     if (!ref || !tp_dev) {
+        LOG_WRN("BLE read_feature_report: ref=%p tp_dev=%p", ref, tp_dev);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
+
+    LOG_DBG("BLE read feature id=%u len=%u offset=%u", ref->id, len, offset);
 
     static uint8_t feature_buf[264];
     uint16_t out_len = 0;
@@ -115,6 +118,9 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
         LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
+
+    LOG_DBG("BLE feature id=%u returned %u bytes (first: 0x%02x)",
+            ref->id, out_len, out_len > 0 ? feature_buf[0] : 0);
 
     return bt_gatt_attr_read(conn, attr, buf, len, offset, feature_buf, out_len);
 }
@@ -259,7 +265,9 @@ static void send_tp_report_callback(struct k_work *work) {
             if (err == -EPERM) {
                 bt_conn_set_security(ctx.conns[i], BT_SECURITY_L2);
             } else if (err) {
-                LOG_DBG("Error notifying %d", err);
+                /* WRN: a failed notify is a dropped frame (e.g. -ENOMEM =
+                 * ATT TX buffer exhaustion, -ENOTCONN/-EINVAL = no CCC). */
+                LOG_WRN("Error notifying %d", err);
             }
             bt_conn_unref(ctx.conns[i]);
         }

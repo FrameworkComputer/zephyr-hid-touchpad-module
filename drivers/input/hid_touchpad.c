@@ -189,6 +189,22 @@ static int hid_touchpad_report_data(const struct device *dev) {
     LOG_DBG("Report ID: %d, Len: %d", report_id, data_len);
     LOG_HEXDUMP_DBG(&data->report_buf[2], report_len - 2, "Raw report");
 
+    /* DEBUG (TP-over-BLE choppiness): 1 Hz production-rate counter, to split
+     * "TP frames read too slowly" from "frames pile up on the way out".
+     * Remove when the investigation is done. */
+    {
+        static uint32_t frame_count;
+        static int64_t last_report_ms;
+        int64_t now = k_uptime_get();
+
+        frame_count++;
+        if (now - last_report_ms >= 1000) {
+            LOG_INF("tp input: %u frames in %lld ms", frame_count, now - last_report_ms);
+            frame_count = 0;
+            last_report_ms = now;
+        }
+    }
+
     for (int i = 0; i < data->num_cbs; i++) {
         if (data->input_cbs[i]) {
             data->input_cbs[i](dev, report_id, &data->report_buf[3], data_len);
