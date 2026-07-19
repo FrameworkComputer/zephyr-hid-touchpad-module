@@ -16,6 +16,21 @@ config INPUT_HID_TOUCHPAD_INIT_PRIORITY
     help
       Device driver initialization priority.
 
+config HID_TOUCHPAD_WORKQUEUE_STACK_SIZE
+    int "Touchpad work queue stack size"
+    default 1280
+    help
+      Stack size of the dedicated work queue that reads input reports over
+      I2C. A dedicated queue keeps the latency-sensitive report reads
+      independent of system workqueue stalls (e.g. HID TX submits blocking
+      on their semaphore).
+
+config HID_TOUCHPAD_WORKQUEUE_PRIORITY
+    int "Touchpad work queue cooperative priority"
+    default 3
+    help
+      Cooperative priority (K_PRIO_COOP) of the touchpad report work queue.
+
 config HID_PASSTHROUGH_USB
     bool "USB HID Passthrough for touchpad"
     depends on USB_DEVICE_HID || USBD_HID_SUPPORT

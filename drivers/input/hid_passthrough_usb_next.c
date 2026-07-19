@@ -11,6 +11,7 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
+#include <zephyr/drivers/usb/usb_buf.h>
 
 #include "hid_touchpad.h"
 
@@ -103,10 +104,30 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
     return err;
 }
 
+/* TX bounce buffer for async submits: with ops.input_report_done set,
+ * hid_device_submit_report() returns right after enqueue and the USB stack
+ * owns the buffer until the done callback — so it cannot live on the stack.
+ * UDC-aligned because the DWC2 DMA path rejects under-aligned buffers.
+ * Without the callback the submit blocks on a K_FOREVER semaphore until the
+ * IN transfer completes; when USB drops mid-transfer that wedges the calling
+ * (touchpad) context until replug. tp_tx_free tracks buffer ownership with a
+ * bounded wait instead: a stalled transfer costs at most TP_TX_TIMEOUT per
+ * frame and drops it (PTP recovers on the next frame). */
+UDC_STATIC_BUF_DEFINE(tp_tx_buf, 64);
+static K_SEM_DEFINE(tp_tx_free, 1, 1);
+#define TP_TX_TIMEOUT K_MSEC(20)
+
+static void input_report_done_cb(const struct device *dev, const uint8_t *const report) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(report);
+    k_sem_give(&tp_tx_free);
+}
+
 static const struct hid_device_ops ops = {
     .iface_ready = iface_ready_cb,
     .get_report = get_report_cb,
     .set_report = set_report_cb,
+    .input_report_done = input_report_done_cb,
 };
 
 static void tp_input_cb(const struct device *dev, uint8_t report_id,
@@ -116,17 +137,22 @@ static void tp_input_cb(const struct device *dev, uint8_t report_id,
     }
 
     /* hid_device_submit_report() expects the report ID as the first byte. */
-    uint8_t buf[64];
-    if ((size_t)len + 1 > sizeof(buf)) {
+    if ((size_t)len + 1 > sizeof(tp_tx_buf)) {
         LOG_WRN("input report too large: %u", len);
         return;
     }
-    buf[0] = report_id;
-    memcpy(&buf[1], data, len);
+    if (k_sem_take(&tp_tx_free, TP_TX_TIMEOUT) != 0) {
+        LOG_WRN("TX buffer still in flight, dropping frame");
+        return;
+    }
+    tp_tx_buf[0] = report_id;
+    memcpy(&tp_tx_buf[1], data, len);
 
-    int err = hid_device_submit_report(hid_dev, len + 1, buf);
+    int err = hid_device_submit_report(hid_dev, len + 1, tp_tx_buf);
     if (err) {
-        LOG_DBG("submit_report failed: %d", err);
+        /* Not enqueued; the done callback will never fire for it. */
+        k_sem_give(&tp_tx_free);
+        LOG_WRN("submit_report failed: %d", err);
     }
 }
 

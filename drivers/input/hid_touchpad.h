@@ -52,7 +52,8 @@ struct hid_touchpad_data {
 
 /**
  * Register a callback to receive raw input reports from the touchpad.
- * The callback is invoked from the system work queue.
+ * The callback is invoked from the driver's dedicated work queue; it may
+ * block briefly (bounded), but every ms spent here delays the next report.
  */
 void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb);
 
