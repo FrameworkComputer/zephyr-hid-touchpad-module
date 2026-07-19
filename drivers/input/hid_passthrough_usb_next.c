@@ -13,6 +13,8 @@
 #include <zephyr/usb/class/usbd_hid.h>
 #include <zephyr/drivers/usb/usb_buf.h>
 
+#include <zmk/endpoints.h>
+
 #include "hid_touchpad.h"
 
 #include <zephyr/logging/log.h>
@@ -133,6 +135,13 @@ static const struct hid_device_ops ops = {
 static void tp_input_cb(const struct device *dev, uint8_t report_id,
                         const uint8_t *data, uint16_t len) {
     if (!hid_ready) {
+        return;
+    }
+
+    /* Follow the same endpoint selection as the keyboard (zmk_endpoints):
+     * only stream the pad over USB when USB is the selected transport, so it
+     * doesn't mirror to both USB and BLE at once. */
+    if (zmk_endpoint_get_selected().transport != ZMK_TRANSPORT_USB) {
         return;
     }
 

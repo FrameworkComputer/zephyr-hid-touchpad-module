@@ -10,6 +10,8 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/util.h>
 
+#include <zmk/endpoints.h>
+
 #include "hid_touchpad.h"
 
 #include <zephyr/logging/log.h>
@@ -278,6 +280,13 @@ K_WORK_DEFINE(tp_hog_work, send_tp_report_callback);
 
 static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
                              const uint8_t *data, uint16_t len) {
+    /* Follow the same endpoint selection as the keyboard (zmk_endpoints):
+     * only stream the pad over BLE when BLE is the selected transport, so it
+     * doesn't mirror to both USB and BLE at once. */
+    if (zmk_endpoint_get_selected().transport != ZMK_TRANSPORT_BLE) {
+        return;
+    }
+
     /* Only forward input reports (mouse and PTP) */
     if (report_id != TP_MOUSE_INPUT_REPORT_ID && report_id != TP_PTP_INPUT_REPORT_ID) {
         return;
