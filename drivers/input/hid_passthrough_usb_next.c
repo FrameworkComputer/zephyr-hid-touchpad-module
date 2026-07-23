@@ -14,6 +14,7 @@
 #include <zephyr/drivers/usb/usb_buf.h>
 
 #include <zmk/endpoints.h>
+#include <zmk/usb.h>
 
 #include "hid_touchpad.h"
 
@@ -142,6 +143,14 @@ static void tp_input_cb(const struct device *dev, uint8_t report_id,
      * only stream the pad over USB when USB is the selected transport, so it
      * doesn't mirror to both USB and BLE at once. */
     if (zmk_endpoint_get_selected().transport != ZMK_TRANSPORT_USB) {
+        return;
+    }
+
+    if (zmk_usb_is_suspended()) {
+        /* Host asleep: request remote wakeup and drop the frame (PTP recovers
+         * once the bus resumes). Submitting while suspended would only stall
+         * on the un-polled endpoint and time out. */
+        zmk_usb_wakeup_request();
         return;
     }
 
