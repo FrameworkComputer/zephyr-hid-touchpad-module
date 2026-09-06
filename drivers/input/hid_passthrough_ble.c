@@ -114,20 +114,38 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
 
     LOG_DBG("BLE read feature id=%u len=%u offset=%u", ref->id, len, offset);
 
+    /* One-entry response cache. A report longer than MTU-1 arrives as an
+     * ATT read followed by read-blob requests at increasing offsets; each
+     * used to re-run the I2C GET, so a 256-byte report at a 23-byte MTU
+     * cost ~12 round trips and every chunk could come from a different
+     * snapshot. Fetch on offset 0 and serve the blobs from the copy, as long
+     * as they ask for the same id within the cached length; anything else
+     * (a blob for another id, a stale offset) refetches. Single-central
+     * device and all GATT callbacks run on the BT RX thread, so no locking
+     * is needed. */
     static uint8_t feature_buf[264];
-    uint16_t out_len = 0;
+    static uint16_t feature_buf_len; /* 0 = nothing cached */
+    static uint8_t feature_buf_id;
 
-    int err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
-                                      feature_buf, sizeof(feature_buf), &out_len);
-    if (err) {
-        LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
-        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    bool cached = offset > 0 && feature_buf_len > 0 && feature_buf_id == ref->id &&
+                  offset <= feature_buf_len; /* == : the empty terminating blob */
+    if (!cached) {
+        uint16_t out_len = 0;
+        feature_buf_len = 0;
+        int err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
+                                          feature_buf, sizeof(feature_buf), &out_len);
+        if (err) {
+            LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
+            return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+        }
+        feature_buf_len = out_len;
+        feature_buf_id = ref->id;
+
+        LOG_DBG("BLE feature id=%u returned %u bytes (first: 0x%02x)",
+                ref->id, out_len, out_len > 0 ? feature_buf[0] : 0);
     }
 
-    LOG_DBG("BLE feature id=%u returned %u bytes (first: 0x%02x)",
-            ref->id, out_len, out_len > 0 ? feature_buf[0] : 0);
-
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, feature_buf, out_len);
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, feature_buf, feature_buf_len);
 }
 
 static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
