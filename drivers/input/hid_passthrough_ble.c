@@ -50,8 +50,12 @@ enum {
     HIDS_FEATURE = 0x03,
 };
 
+/* HIDS HID Information. version is bcdHID, the HID *specification* version
+ * we claim (1.11, like the keyboard HOG), NOT the pad's firmware version;
+ * hosts may parse it as such. The pad FW version is host-readable via the
+ * vendor feature reports instead. */
 static struct hids_info tp_info = {
-    .version = 0x0000,
+    .version = 0x0111,
     .code = 0x00,
     .flags = HIDS_NORMALLY_CONNECTABLE | HIDS_REMOTE_WAKE,
 };
