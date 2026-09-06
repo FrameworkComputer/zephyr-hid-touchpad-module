@@ -337,6 +337,16 @@ static int hid_touchpad_init(const struct device *dev) {
 
     /* Do NOT disable PTP — let the OS control input mode via feature reports */
 
+    /* The pad keeps its power state across host reboots (it sits on its own
+     * rail), so if it was left in SET_POWER sleep it would stay silent
+     * forever. Send SET_POWER on unconditionally — a no-op when already
+     * running. */
+    uint8_t pwr_cmd[4] = {data->command_reg, 0x00, I2C_HID_PWR_ON, I2C_HID_SET_POWER};
+    err = i2c_write_dt(&config->i2c_bus, pwr_cmd, sizeof(pwr_cmd));
+    if (err) {
+        LOG_WRN("SET_POWER on at init failed: %d", err);
+    }
+
     data->dev = dev;
 
     static bool workq_started;
