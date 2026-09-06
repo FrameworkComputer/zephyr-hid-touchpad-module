@@ -237,7 +237,7 @@ BT_GATT_SERVICE_DEFINE(
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
 
 /* Work queue for BLE notifications */
-K_THREAD_STACK_DEFINE(tp_hog_q_stack, 768);
+K_THREAD_STACK_DEFINE(tp_hog_q_stack, CONFIG_HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE);
 static struct k_work_q tp_hog_work_q;
 
 /* Message queue entry: report_id + data */

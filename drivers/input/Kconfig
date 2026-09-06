@@ -65,6 +65,16 @@ config HID_PASSTHROUGH_BLE
       Enable BLE HOGP passthrough for the touchpad as a second HID service,
       notifying the central of ZMK's active profile. Requires ZMK.
 
+config HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE
+    int "BLE passthrough notify work queue stack size"
+    depends on HID_PASSTHROUGH_BLE
+    default 1024
+    help
+      Stack size of the work queue that sends the touchpad's BLE
+      notifications (bt_gatt_notify_cb: ATT encode + L2CAP path). The
+      previous fixed 768 bytes never overflowed on hardware but had no
+      headroom analysis behind it.
+
 config HID_PASSTHROUGH_BLE_PACE_MS
     int "Fallback pace for BLE PTP motion notifications (ms, 0=off)"
     depends on HID_PASSTHROUGH_BLE
