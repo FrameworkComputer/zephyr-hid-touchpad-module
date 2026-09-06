@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2025 The ZMK Contributors
+ * Copyright (c) 2025-2026 Framework Computer Inc
  *
  * SPDX-License-Identifier: MIT
  */
@@ -18,6 +19,13 @@
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_touchpad, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
+
+/* The descriptor and feature-size table below are taken from instance 0
+ * while the device glue is instance-templated. That is deliberate: the BLE
+ * service and the USB tp_hid node are single-instance too, and no board has
+ * a second pad. Make the assumption explicit instead of half-supporting it. */
+BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) == 1,
+             "hid_touchpad supports exactly one enabled zmk,hid-touchpad instance");
 
 /* HID report descriptor from devicetree */
 const uint8_t tp_report_desc[] = DT_INST_PROP(0, report_descriptor);
@@ -378,9 +386,16 @@ static int hid_touchpad_init(const struct device *dev) {
 
     data->command_reg = hid_desc[16];
     data->data_reg = hid_desc[18];
-    data->input_reg = sys_get_le16(&hid_desc[8]);
     data->max_input_len = sys_get_le16(&hid_desc[10]);
 
+    /* A frame is at least the 2 length bytes + report ID. Anything smaller
+     * means we read garbage instead of a descriptor (wrong register, pad not
+     * in HID mode); the read path's report_len < 3 guard would keep us safe
+     * later, but don't present a plausible-looking driver on top of it. */
+    if (data->max_input_len < 3) {
+        LOG_ERR("implausible wMaxInputLength %d, descriptor invalid", data->max_input_len);
+        return -ENODEV;
+    }
     /* Clamp max_input_len to our buffer size */
     if (data->max_input_len > sizeof(data->report_buf)) {
         LOG_WRN("max_input_len %d exceeds buffer, clamping to %d",
@@ -388,8 +403,10 @@ static int hid_touchpad_init(const struct device *dev) {
         data->max_input_len = sizeof(data->report_buf);
     }
 
+    /* The input register is not needed: per I2C-HID, input reports are read
+     * with a plain read (no register address). Log it for reference only. */
     LOG_INF("command_reg=0x%02x data_reg=0x%02x input_reg=0x%04x max_input_len=%d",
-            data->command_reg, data->data_reg, data->input_reg, data->max_input_len);
+            data->command_reg, data->data_reg, sys_get_le16(&hid_desc[8]), data->max_input_len);
 
     /* Do NOT disable PTP — let the OS control input mode via feature reports */
 

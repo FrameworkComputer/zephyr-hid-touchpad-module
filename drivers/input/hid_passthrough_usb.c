@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2025 The ZMK Contributors
+ * Copyright (c) 2025-2026 Framework Computer Inc
  *
  * SPDX-License-Identifier: MIT
  */

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2025 The ZMK Contributors
+ * Copyright (c) 2025-2026 Framework Computer Inc
  *
  * SPDX-License-Identifier: MIT
  */
@@ -47,7 +48,6 @@ struct hid_touchpad_data {
     uint8_t command_reg;
     uint8_t data_reg;
     uint16_t max_input_len;
-    uint16_t input_reg;
     struct gpio_callback gpio_cb;
     struct k_work work;
     hid_touchpad_input_cb_t input_cbs[HID_TOUCHPAD_MAX_CBS];
