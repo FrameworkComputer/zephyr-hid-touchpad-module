@@ -105,7 +105,7 @@ static ssize_t read_ptp_input_report(struct bt_conn *conn, const struct bt_gatt_
 static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                     void *buf, uint16_t len, uint16_t offset) {
     struct hids_report *ref = (struct hids_report *)attr->user_data;
-    if (!ref || !tp_dev) {
+    if (!ref || tp_dev == NULL || !device_is_ready(tp_dev)) {
         LOG_WRN("BLE read_feature_report: ref=%p tp_dev=%p", ref, tp_dev);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
@@ -132,7 +132,10 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
                                      const void *buf, uint16_t len, uint16_t offset,
                                      uint8_t flags) {
     struct hids_report *ref = (struct hids_report *)attr->user_data;
-    if (!ref || !tp_dev || offset != 0) {
+    if (!ref || tp_dev == NULL || !device_is_ready(tp_dev)) {
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+    if (offset != 0) {
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
 
@@ -384,11 +387,18 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
 }
 
 static int hid_passthrough_ble_init(void) {
-    tp_dev = DEVICE_DT_GET(TP_NODE);
-    if (!device_is_ready(tp_dev)) {
-        LOG_ERR("Touchpad device not ready");
-        return -ENODEV;
+    /* The GATT service is registered statically whatever happens here, so a
+     * pad that failed init still shows up to the host. Leave tp_dev NULL in
+     * that case: the feature callbacks then answer with an ATT error instead
+     * of clocking I2C transactions against an unconfigured device
+     * (command_reg/data_reg = 0). Returning an error from SYS_INIT would buy
+     * nothing, so stay idle like the USB backend does. */
+    const struct device *dev = DEVICE_DT_GET(TP_NODE);
+    if (!device_is_ready(dev)) {
+        LOG_ERR("Touchpad device not ready, BLE passthrough idle");
+        return 0;
     }
+    tp_dev = dev;
 
     static const struct k_work_queue_config queue_config = {
         .name = "TP HOG Send Work"
