@@ -245,28 +245,42 @@ static bool tp_pending_valid;
 static bool tp_pending_urgent;
 static struct k_spinlock tp_pending_lock;
 static int64_t tp_last_send_ms;
+/* PTP payload layout (report-descriptor order): TP_PTP_MAX_CONTACTS finger
+ * records of (status byte + x u16 + y u16), then contact count (1), buttons
+ * (1), scan time (2). Everything derives from ptp-input-report-size so a
+ * pad with a different per-contact record still lands on the right bytes;
+ * the contact count is fixed at 5 like the descriptor's. */
+#define TP_PTP_MAX_CONTACTS 5
+#define TP_PTP_TRAILER_LEN  4 /* count + buttons + scan time */
+#define TP_PTP_FINGERS_LEN  (TP_PTP_INPUT_REPORT_SIZE - TP_PTP_TRAILER_LEN)
+#define TP_PTP_STRIDE       (TP_PTP_FINGERS_LEN / TP_PTP_MAX_CONTACTS)
+#define TP_PTP_COUNT_OFF    TP_PTP_FINGERS_LEN
+#define TP_PTP_BTN_OFF      (TP_PTP_FINGERS_LEN + 1)
+BUILD_ASSERT(TP_PTP_FINGERS_LEN > 0 && TP_PTP_FINGERS_LEN % TP_PTP_MAX_CONTACTS == 0,
+             "ptp-input-report-size doesn't fit 5 equal contact records + 4 trailer bytes");
+#define TP_PTP_STATE_LEN    (TP_PTP_MAX_CONTACTS + 2) /* status bytes + count + buttons */
+
 /* Finger status bytes (confidence/tip/contact-id), contact count and
  * buttons of the last frame actually sent; a change makes a frame urgent.
  * Read and written only under tp_pending_lock: the input callback (TP
  * workq, higher coop priority) can preempt the sender mid-update, and a
  * torn read here would mark a tip/button transition non-urgent, letting a
  * later overwrite of the pending slot swallow it. */
-static uint8_t tp_sent_state[7];
+static uint8_t tp_sent_state[TP_PTP_STATE_LEN];
 
-/* PTP payload layout: 5 x (status byte + x u16 + y u16), contact count,
- * buttons, scan time u16. Extract everything except positions/scan time. */
-static void tp_frame_state(const uint8_t *data, uint16_t len, uint8_t out[7]) {
-    memset(out, 0, 7);
-    for (int i = 0; i < 5; i++) {
-        if (i * 5 < len) {
-            out[i] = data[i * 5];
+/* Extract everything except positions and scan time. */
+static void tp_frame_state(const uint8_t *data, uint16_t len, uint8_t out[TP_PTP_STATE_LEN]) {
+    memset(out, 0, TP_PTP_STATE_LEN);
+    for (int i = 0; i < TP_PTP_MAX_CONTACTS; i++) {
+        if (i * TP_PTP_STRIDE < len) {
+            out[i] = data[i * TP_PTP_STRIDE];
         }
     }
-    if (len >= 26) {
-        out[5] = data[25];
+    if (len > TP_PTP_COUNT_OFF) {
+        out[TP_PTP_MAX_CONTACTS] = data[TP_PTP_COUNT_OFF];
     }
-    if (len >= 27) {
-        out[6] = data[26];
+    if (len > TP_PTP_BTN_OFF) {
+        out[TP_PTP_MAX_CONTACTS + 1] = data[TP_PTP_BTN_OFF];
     }
 }
 
