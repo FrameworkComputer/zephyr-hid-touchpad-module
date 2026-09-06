@@ -385,11 +385,22 @@ static int hid_touchpad_init(const struct device *dev) {
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
 static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_action action) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
         return set_int(dev, false);
-    case PM_DEVICE_ACTION_RESUME:
-        return set_int(dev, true);
+    case PM_DEVICE_ACTION_RESUME: {
+        int ret = set_int(dev, true);
+        /* A report that became ready while suspended holds DR asserted, and
+         * the edge-triggered interrupt never fires for it — drain it once,
+         * same as init does. */
+        if (ret == 0 && gpio_pin_get_dt(&config->dr) > 0) {
+            k_work_submit_to_queue(&tp_workq, &data->work);
+        }
+        return ret;
+    }
     default:
         return -ENOTSUP;
     }
