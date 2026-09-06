@@ -246,7 +246,11 @@ static bool tp_pending_urgent;
 static struct k_spinlock tp_pending_lock;
 static int64_t tp_last_send_ms;
 /* Finger status bytes (confidence/tip/contact-id), contact count and
- * buttons of the last frame actually sent; a change makes a frame urgent. */
+ * buttons of the last frame actually sent; a change makes a frame urgent.
+ * Read and written only under tp_pending_lock: the input callback (TP
+ * workq, higher coop priority) can preempt the sender mid-update, and a
+ * torn read here would mark a tip/button transition non-urgent, letting a
+ * later overwrite of the pending slot swallow it. */
 static uint8_t tp_sent_state[7];
 
 /* PTP payload layout: 5 x (status byte + x u16 + y u16), contact count,
@@ -333,9 +337,10 @@ static void send_tp_report_callback(struct k_work *work) {
     tp_pending_valid = false;
     tp_pending_urgent = false;
     tp_last_send_ms = k_uptime_get();
+    /* ~10 loads; cheap enough to keep under the lock (see tp_sent_state) */
+    tp_frame_state(msg.data, msg.len, tp_sent_state);
     k_spin_unlock(&tp_pending_lock, key);
 
-    tp_frame_state(msg.data, msg.len, tp_sent_state);
     tp_notify_conns(&msg);
 }
 
@@ -370,9 +375,9 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
      * one goes out — overwriting the pending frame can't swallow it. */
     uint8_t state[sizeof(tp_sent_state)];
     tp_frame_state(data, len, state);
-    bool urgent = memcmp(state, tp_sent_state, sizeof(state)) != 0;
 
     k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+    bool urgent = memcmp(state, tp_sent_state, sizeof(state)) != 0;
     tp_pending.report_id = report_id;
     tp_pending.len = MIN(len, sizeof(tp_pending.data));
     memcpy(tp_pending.data, data, tp_pending.len);
