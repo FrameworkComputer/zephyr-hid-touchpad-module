@@ -219,53 +219,122 @@ struct tp_report_msg {
     uint16_t len;
 };
 
+/* Mouse-mode (id 1) reports are RELATIVE — coalescing would lose deltas —
+ * so they pass through this queue unpaced. Only hosts that never switch
+ * the pad to PTP mode ever see them. */
 K_MSGQ_DEFINE(tp_report_msgq, sizeof(struct tp_report_msg), 8, 4);
+
+/* PTP (id 4) frames carry ABSOLUTE positions, so only the newest pending
+ * frame matters; older unsent motion is subsumed by it. Pure-motion frames
+ * are paced to one notification per TP_PACE_MS: BLE delivers whatever is
+ * queued as a burst within one connection event, and burst-mates (arrival
+ * deltas of ~50 us) trip libinput's touchpad jump detection, which then
+ * DISCARDS their motion (~half the cursor travel, measured 0.53x). One
+ * frame per connection event keeps host arrival timestamps regular; the
+ * 10 ms default also matches libinput's hardcoded Bluetooth velocity
+ * assumption, and the scan-time field still carries true device timing
+ * for hosts that use it. Frames with tip/confidence/contact-id/button
+ * changes skip the pacing so tap/click latency is unaffected. */
+#define TP_PACE_MS CONFIG_HID_PASSTHROUGH_BLE_PACE_MS
+
+static struct tp_report_msg tp_pending;
+static bool tp_pending_valid;
+static bool tp_pending_urgent;
+static struct k_spinlock tp_pending_lock;
+static int64_t tp_last_send_ms;
+/* Finger status bytes (confidence/tip/contact-id), contact count and
+ * buttons of the last frame actually sent; a change makes a frame urgent. */
+static uint8_t tp_sent_state[7];
+
+/* PTP payload layout: 5 x (status byte + x u16 + y u16), contact count,
+ * buttons, scan time u16. Extract everything except positions/scan time. */
+static void tp_frame_state(const uint8_t *data, uint16_t len, uint8_t out[7]) {
+    memset(out, 0, 7);
+    for (int i = 0; i < 5; i++) {
+        if (i * 5 < len) {
+            out[i] = data[i * 5];
+        }
+    }
+    if (len >= 26) {
+        out[5] = data[25];
+    }
+    if (len >= 27) {
+        out[6] = data[26];
+    }
+}
+
+static void tp_notify_conns(const struct tp_report_msg *msg) {
+    const struct bt_gatt_attr *attr;
+    if (msg->report_id == TP_MOUSE_INPUT_REPORT_ID) {
+        attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
+        memcpy(cached_mouse_report, msg->data,
+               MIN(msg->len, sizeof(cached_mouse_report)));
+    } else if (msg->report_id == TP_PTP_INPUT_REPORT_ID) {
+        attr = &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
+        memcpy(cached_ptp_report, msg->data,
+               MIN(msg->len, sizeof(cached_ptp_report)));
+    } else {
+        return;
+    }
+
+    /* Notify only the central for the currently selected BLE profile, mirroring
+     * ZMK's keyboard HOG (zmk_ble_active_profile_conn). Fanning out to every
+     * connected LE central would mirror the pad to all bonded hosts at once. */
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    if (conn == NULL) {
+        return;
+    }
+
+    struct bt_gatt_notify_params notify_params = {
+        .attr = attr,
+        .data = msg->data,
+        .len = msg->len,
+    };
+
+    int err = bt_gatt_notify_cb(conn, &notify_params);
+    if (err == -EPERM) {
+        bt_conn_set_security(conn, BT_SECURITY_L2);
+    } else if (err) {
+        /* WRN: a failed notify is a dropped frame (e.g. -ENOMEM =
+         * ATT TX buffer exhaustion, -ENOTCONN/-EINVAL = no CCC). */
+        LOG_WRN("Error notifying %d", err);
+    }
+
+    bt_conn_unref(conn);
+}
+
+static void send_tp_report_callback(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(tp_send_work, send_tp_report_callback);
 
 static void send_tp_report_callback(struct k_work *work) {
     struct tp_report_msg msg;
 
+    /* Unpaced mouse-mode reports first */
     while (k_msgq_get(&tp_report_msgq, &msg, K_NO_WAIT) == 0) {
-        const struct bt_gatt_attr *attr;
-        if (msg.report_id == TP_MOUSE_INPUT_REPORT_ID) {
-            attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
-            memcpy(cached_mouse_report, msg.data,
-                   MIN(msg.len, sizeof(cached_mouse_report)));
-        } else if (msg.report_id == TP_PTP_INPUT_REPORT_ID) {
-            attr = &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
-            memcpy(cached_ptp_report, msg.data,
-                   MIN(msg.len, sizeof(cached_ptp_report)));
-        } else {
-            continue;
-        }
-
-        /* Notify only the central for the currently selected BLE profile, mirroring
-         * ZMK's keyboard HOG (zmk_ble_active_profile_conn). Fanning out to every
-         * connected LE central would mirror the pad to all bonded hosts at once. */
-        struct bt_conn *conn = zmk_ble_active_profile_conn();
-        if (conn == NULL) {
-            continue;
-        }
-
-        struct bt_gatt_notify_params notify_params = {
-            .attr = attr,
-            .data = msg.data,
-            .len = msg.len,
-        };
-
-        int err = bt_gatt_notify_cb(conn, &notify_params);
-        if (err == -EPERM) {
-            bt_conn_set_security(conn, BT_SECURITY_L2);
-        } else if (err) {
-            /* WRN: a failed notify is a dropped frame (e.g. -ENOMEM =
-             * ATT TX buffer exhaustion, -ENOTCONN/-EINVAL = no CCC). */
-            LOG_WRN("Error notifying %d", err);
-        }
-
-        bt_conn_unref(conn);
+        tp_notify_conns(&msg);
     }
-}
 
-K_WORK_DEFINE(tp_hog_work, send_tp_report_callback);
+    k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+    if (!tp_pending_valid) {
+        k_spin_unlock(&tp_pending_lock, key);
+        return;
+    }
+    int64_t due = tp_last_send_ms + TP_PACE_MS - k_uptime_get();
+    if (TP_PACE_MS > 0 && !tp_pending_urgent && due > 0) {
+        k_spin_unlock(&tp_pending_lock, key);
+        /* schedule (not reschedule): never push out an earlier deadline */
+        k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_MSEC(due));
+        return;
+    }
+    msg = tp_pending;
+    tp_pending_valid = false;
+    tp_pending_urgent = false;
+    tp_last_send_ms = k_uptime_get();
+    k_spin_unlock(&tp_pending_lock, key);
+
+    tp_frame_state(msg.data, msg.len, tp_sent_state);
+    tp_notify_conns(&msg);
+}
 
 static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
                              const uint8_t *data, uint16_t len) {
@@ -276,23 +345,42 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
         return;
     }
 
-    /* Only forward input reports (mouse and PTP) */
-    if (report_id != TP_MOUSE_INPUT_REPORT_ID && report_id != TP_PTP_INPUT_REPORT_ID) {
+    if (report_id == TP_MOUSE_INPUT_REPORT_ID) {
+        struct tp_report_msg msg;
+        msg.report_id = report_id;
+        msg.len = MIN(len, sizeof(msg.data));
+        memcpy(msg.data, data, msg.len);
+
+        if (k_msgq_put(&tp_report_msgq, &msg, K_NO_WAIT) != 0) {
+            LOG_WRN("TP report queue full, dropping report ID %d", report_id);
+            return;
+        }
+        k_work_reschedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);
+        return;
+    }
+    if (report_id != TP_PTP_INPUT_REPORT_ID) {
         return;
     }
 
-    struct tp_report_msg msg;
-    msg.report_id = report_id;
-    msg.len = MIN(len, sizeof(msg.data));
-    memcpy(msg.data, data, msg.len);
+    /* Urgency is judged against the last frame actually SENT, so once a
+     * state change is pending, every following frame stays urgent until
+     * one goes out — overwriting the pending frame can't swallow it. */
+    uint8_t state[sizeof(tp_sent_state)];
+    tp_frame_state(data, len, state);
+    bool urgent = memcmp(state, tp_sent_state, sizeof(state)) != 0;
 
-    int err = k_msgq_put(&tp_report_msgq, &msg, K_NO_WAIT);
-    if (err) {
-        LOG_WRN("TP report queue full, dropping report ID %d", report_id);
-        return;
-    }
+    k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+    tp_pending.report_id = report_id;
+    tp_pending.len = MIN(len, sizeof(tp_pending.data));
+    memcpy(tp_pending.data, data, tp_pending.len);
+    tp_pending_valid = true;
+    tp_pending_urgent = tp_pending_urgent || urgent;
+    int64_t due = tp_last_send_ms + TP_PACE_MS - k_uptime_get();
+    bool now = TP_PACE_MS <= 0 || tp_pending_urgent || due <= 0;
+    k_spin_unlock(&tp_pending_lock, key);
 
-    k_work_submit_to_queue(&tp_hog_work_q, &tp_hog_work);
+    k_work_reschedule_for_queue(&tp_hog_work_q, &tp_send_work,
+                                now ? K_NO_WAIT : K_MSEC(due));
 }
 
 static int hid_passthrough_ble_init(void) {
