@@ -74,6 +74,12 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
                             uint8_t *buf, uint16_t buf_len, uint16_t *out_len);
 
 /**
+ * Data size (excluding report ID) of a feature report as declared in
+ * devicetree (feature-report-sizes), or -ENOENT for an unknown ID.
+ */
+int hid_touchpad_feature_size(uint8_t id);
+
+/**
  * Set a feature/output report on the touchpad via I2C HID protocol.
  * @param type Report type (I2C_HID_REPORT_TYPE_FEATURE, etc.)
  * @param id   Report ID

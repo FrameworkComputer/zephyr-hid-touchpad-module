@@ -51,3 +51,11 @@ properties:
     type: array
     required: true
     description: List of feature report IDs exposed by this touchpad
+
+  feature-report-sizes:
+    type: array
+    required: true
+    description: >
+      Data size in bytes (excluding the report ID) of each feature report,
+      parallel to feature-report-ids. Bounds the I2C read a GET_REPORT
+      clocks, so a 1-byte report doesn't cost a full-buffer transfer.

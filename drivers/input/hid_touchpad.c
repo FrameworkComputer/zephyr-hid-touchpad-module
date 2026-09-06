@@ -23,6 +23,23 @@ LOG_MODULE_REGISTER(hid_touchpad, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
 const uint8_t tp_report_desc[] = DT_INST_PROP(0, report_descriptor);
 const size_t tp_report_desc_size = DT_INST_PROP_LEN(0, report_descriptor);
 
+/* Feature report id -> data size, from devicetree. Bounds the I2C read a
+ * GET_REPORT clocks: the pad clock-stretches per byte, so an unbounded
+ * 264-byte read cost ~14 ms (400 kHz) for a 1-byte report. */
+static const uint8_t tp_feature_ids[] = DT_INST_PROP(0, feature_report_ids);
+static const uint16_t tp_feature_sizes[] = DT_INST_PROP(0, feature_report_sizes);
+BUILD_ASSERT(ARRAY_SIZE(tp_feature_ids) == ARRAY_SIZE(tp_feature_sizes),
+             "feature-report-sizes must be parallel to feature-report-ids");
+
+int hid_touchpad_feature_size(uint8_t id) {
+    for (size_t i = 0; i < ARRAY_SIZE(tp_feature_ids); i++) {
+        if (tp_feature_ids[i] == id) {
+            return tp_feature_sizes[i];
+        }
+    }
+    return -ENOENT;
+}
+
 /* Dedicated work queue for reading input reports. The system workqueue is
  * NOT safe here: the ZMK HID submit paths run on it and can block it for up
  * to their TX-semaphore timeout (100 ms in usb_hid.c), which starves the
@@ -69,8 +86,22 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
         cmd_len = 7;
     }
 
-    int err = i2c_write_read_dt(&config->i2c_bus, cmd, cmd_len,
-                                 i2c_buf, sizeof(i2c_buf));
+    /* Clock only what can be used: 2 length + 1 report ID bytes of framing
+     * plus the smaller of the declared report size and the caller's buffer
+     * (a host GET with a small wLength shouldn't occupy the bus for 256
+     * bytes either). Unknown IDs and input-type GETs keep the full-buffer
+     * read: rare, correct, just slow. The response's length field still
+     * tells us the true frame size, so a device reporting a shorter frame
+     * than we read is handled exactly as before. */
+    size_t read_len = sizeof(i2c_buf);
+    if (type == I2C_HID_REPORT_TYPE_FEATURE) {
+        int size = hid_touchpad_feature_size(id);
+        if (size >= 0) {
+            read_len = MIN((size_t)MIN(size, buf_len) + 3, sizeof(i2c_buf));
+        }
+    }
+
+    int err = i2c_write_read_dt(&config->i2c_bus, cmd, cmd_len, i2c_buf, read_len);
     if (err) {
         LOG_ERR("get_report id=%u failed: %d", id, err);
         return err;
@@ -82,8 +113,9 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
         return -EINVAL;
     }
 
-    /* i2c_buf[0..1] = length, i2c_buf[2] = report ID, i2c_buf[3..] = data */
-    uint16_t data_len = frame_len - 3;
+    /* i2c_buf[0..1] = length, i2c_buf[2] = report ID, i2c_buf[3..] = data.
+     * Never hand out more than was actually read. */
+    uint16_t data_len = MIN(frame_len, read_len) - 3;
     uint16_t copy_len = MIN(data_len, buf_len);
     memcpy(buf, &i2c_buf[3], copy_len);
     *out_len = copy_len;
