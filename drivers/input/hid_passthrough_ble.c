@@ -426,13 +426,25 @@ static void tp_notify_conns(const struct tp_report_msg *msg) {
         .len = msg->len,
     };
 
+    /* A failed notify is a dropped frame (e.g. -ENOMEM = ATT TX buffer
+     * exhaustion, -ENOTCONN/-EINVAL = no CCC). Warn on the first failure and
+     * on every success->failure edge only: while connected+selected but the
+     * CCC not yet enabled (fresh bond mid-enumeration) this fails for every
+     * frame, and a WRN per frame at ~130 Hz drowns the log. */
+    static bool notify_failing;
     int err = bt_gatt_notify_cb(conn, &notify_params);
     if (err == -EPERM) {
         bt_conn_set_security(conn, BT_SECURITY_L2);
     } else if (err) {
-        /* WRN: a failed notify is a dropped frame (e.g. -ENOMEM =
-         * ATT TX buffer exhaustion, -ENOTCONN/-EINVAL = no CCC). */
-        LOG_WRN("Error notifying %d", err);
+        if (!notify_failing) {
+            LOG_WRN("Error notifying %d (further failures at DBG until one succeeds)", err);
+            notify_failing = true;
+        } else {
+            LOG_DBG("Error notifying %d", err);
+        }
+    } else if (notify_failing) {
+        notify_failing = false;
+        LOG_INF("Notifications flowing again");
     }
 
     bt_conn_unref(conn);
