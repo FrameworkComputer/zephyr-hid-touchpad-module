@@ -12,6 +12,8 @@
 
 #include <zmk/ble.h>
 #include <zmk/endpoints.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/ble_active_profile_changed.h>
 
 #include "hid_touchpad.h"
 
@@ -229,22 +231,40 @@ K_MSGQ_DEFINE(tp_report_msgq, sizeof(struct tp_report_msg), 8, 4);
 
 /* PTP (id 4) frames carry ABSOLUTE positions, so only the newest pending
  * frame matters; older unsent motion is subsumed by it. Pure-motion frames
- * are paced to one notification per TP_PACE_MS: BLE delivers whatever is
- * queued as a burst within one connection event, and burst-mates (arrival
- * deltas of ~50 us) trip libinput's touchpad jump detection, which then
- * DISCARDS their motion (~half the cursor travel, measured 0.53x). One
- * frame per connection event keeps host arrival timestamps regular; the
- * 10 ms default also matches libinput's hardcoded Bluetooth velocity
- * assumption, and the scan-time field still carries true device timing
- * for hosts that use it. Frames with tip/confidence/contact-id/button
- * changes skip the pacing so tap/click latency is unaffected. */
-#define TP_PACE_MS CONFIG_HID_PASSTHROUGH_BLE_PACE_MS
+ * are paced to one notification per connection interval: BLE delivers
+ * whatever is queued as a burst within one connection event, and
+ * burst-mates (arrival deltas of ~50 us) trip libinput's touchpad jump
+ * detection, which then DISCARDS their motion (~half the cursor travel,
+ * measured 0.53x). One frame per connection event keeps host arrival
+ * timestamps regular, and the scan-time field still carries true device
+ * timing for hosts that use it. Frames with tip/confidence/contact-id/
+ * button changes skip the pacing so tap/click latency is unaffected.
+ *
+ * The pace follows the interval the central actually granted (refreshed
+ * from the active profile's connection, see tp_pace_refresh), minus a
+ * small margin so scheduling jitter can't land two sends in one event. A
+ * fixed pace that doesn't divide the interval quantizes onto the event
+ * grid as a beat: 10 ms sends on the 7.5 ms both our centrals grant went
+ * on air 15/7.5/7.5 ms apart with every third frame carrying double
+ * travel. At 7.5 ms the pace (7.0 ms) sits below the pad period (~7.6 ms
+ * in Run), so nothing is coalesced and every pad frame gets its own event;
+ * at >= 10 ms grants pacing re-engages and coalesces regularly. The
+ * Kconfig value is only the fallback when no connection info is available
+ * (0 turns pacing off entirely). Arithmetic is in ticks: 7.5 ms is not
+ * expressible in ms and a 0.5 ms/frame error would be the beat again. */
+#define TP_PACE_FALLBACK_US (CONFIG_HID_PASSTHROUGH_BLE_PACE_MS * 1000)
+#define TP_PACE_MARGIN_US   500
+#define TP_PACE_MIN_US      2000
+#define TP_PACE_ENABLED     (CONFIG_HID_PASSTHROUGH_BLE_PACE_MS > 0)
 
 static struct tp_report_msg tp_pending;
 static bool tp_pending_valid;
 static bool tp_pending_urgent;
 static struct k_spinlock tp_pending_lock;
-static int64_t tp_last_send_ms;
+static int64_t tp_last_send_ticks;
+/* Current pace in ticks (0 = every frame goes out immediately); read and
+ * written under tp_pending_lock. */
+static k_ticks_t tp_pace_ticks;
 /* PTP payload layout (report-descriptor order): TP_PTP_MAX_CONTACTS finger
  * records of (status byte + x u16 + y u16), then contact count (1), buttons
  * (1), scan time (2). Everything derives from ptp-input-report-size so a
@@ -283,6 +303,81 @@ static void tp_frame_state(const uint8_t *data, uint16_t len, uint8_t out[TP_PTP
         out[TP_PTP_MAX_CONTACTS + 1] = data[TP_PTP_BTN_OFF];
     }
 }
+
+/* Derive the pace from a connection's granted interval; NULL selects the
+ * Kconfig fallback. Runs from the BT RX thread (conn callbacks), the system
+ * workqueue (ZMK events) and init. */
+static void tp_pace_refresh(struct bt_conn *conn) {
+    struct bt_conn_info info;
+    uint32_t interval_us = 0;
+    uint32_t pace_us = TP_PACE_FALLBACK_US;
+
+    if (conn != NULL && bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE &&
+        info.le.interval_us > 0) {
+        interval_us = info.le.interval_us;
+        pace_us = MAX(interval_us - TP_PACE_MARGIN_US, TP_PACE_MIN_US);
+    }
+
+    k_ticks_t ticks = TP_PACE_ENABLED ? k_us_to_ticks_ceil64(pace_us) : 0;
+
+    k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+    bool changed = ticks != tp_pace_ticks;
+    tp_pace_ticks = ticks;
+    k_spin_unlock(&tp_pending_lock, key);
+
+    if (changed) {
+        LOG_INF("PTP pace %u us (conn interval %u us%s)", TP_PACE_ENABLED ? pace_us : 0,
+                interval_us, interval_us ? "" : ", fallback");
+    }
+}
+
+/* The conn callbacks fire for every connection; only the active profile's
+ * one sets the pace (same peer-address match ZMK uses to find it). */
+static bool tp_conn_is_active_profile(struct bt_conn *conn) {
+    return bt_addr_le_cmp(bt_conn_get_dst(conn), zmk_ble_active_profile_addr()) == 0;
+}
+
+static void tp_conn_connected(struct bt_conn *conn, uint8_t err) {
+    if (err == 0 && tp_conn_is_active_profile(conn)) {
+        tp_pace_refresh(conn);
+    }
+}
+
+static void tp_conn_disconnected(struct bt_conn *conn, uint8_t reason) {
+    if (tp_conn_is_active_profile(conn)) {
+        tp_pace_refresh(NULL);
+    }
+}
+
+static void tp_conn_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
+                                     uint16_t timeout) {
+    if (tp_conn_is_active_profile(conn)) {
+        tp_pace_refresh(conn);
+    }
+}
+
+BT_CONN_CB_DEFINE(tp_conn_callbacks) = {
+    .connected = tp_conn_connected,
+    .disconnected = tp_conn_disconnected,
+    .le_param_updated = tp_conn_le_param_updated,
+};
+
+/* A profile switch changes which connection's interval matters without any
+ * connection-parameter event firing. */
+static int tp_profile_changed_listener(const zmk_event_t *eh) {
+    struct bt_conn *conn = NULL;
+    if (zmk_ble_active_profile_is_connected()) {
+        conn = zmk_ble_active_profile_conn();
+    }
+    tp_pace_refresh(conn);
+    if (conn != NULL) {
+        bt_conn_unref(conn);
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(hid_passthrough_ble, tp_profile_changed_listener);
+ZMK_SUBSCRIPTION(hid_passthrough_ble, zmk_ble_active_profile_changed);
 
 static void tp_notify_conns(const struct tp_report_msg *msg) {
     const struct bt_gatt_attr *attr;
@@ -340,17 +435,17 @@ static void send_tp_report_callback(struct k_work *work) {
         k_spin_unlock(&tp_pending_lock, key);
         return;
     }
-    int64_t due = tp_last_send_ms + TP_PACE_MS - k_uptime_get();
-    if (TP_PACE_MS > 0 && !tp_pending_urgent && due > 0) {
+    k_ticks_t due = tp_last_send_ticks + tp_pace_ticks - k_uptime_ticks();
+    if (tp_pace_ticks > 0 && !tp_pending_urgent && due > 0) {
         k_spin_unlock(&tp_pending_lock, key);
         /* schedule (not reschedule): never push out an earlier deadline */
-        k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_MSEC(due));
+        k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_TICKS(due));
         return;
     }
     msg = tp_pending;
     tp_pending_valid = false;
     tp_pending_urgent = false;
-    tp_last_send_ms = k_uptime_get();
+    tp_last_send_ticks = k_uptime_ticks();
     /* ~10 loads; cheap enough to keep under the lock (see tp_sent_state) */
     tp_frame_state(msg.data, msg.len, tp_sent_state);
     k_spin_unlock(&tp_pending_lock, key);
@@ -397,12 +492,12 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
     memcpy(tp_pending.data, data, tp_pending.len);
     tp_pending_valid = true;
     tp_pending_urgent = tp_pending_urgent || urgent;
-    int64_t due = tp_last_send_ms + TP_PACE_MS - k_uptime_get();
-    bool now = TP_PACE_MS <= 0 || tp_pending_urgent || due <= 0;
+    k_ticks_t due = tp_last_send_ticks + tp_pace_ticks - k_uptime_ticks();
+    bool now = tp_pace_ticks <= 0 || tp_pending_urgent || due <= 0;
     k_spin_unlock(&tp_pending_lock, key);
 
     k_work_reschedule_for_queue(&tp_hog_work_q, &tp_send_work,
-                                now ? K_NO_WAIT : K_MSEC(due));
+                                now ? K_NO_WAIT : K_TICKS(due));
 }
 
 /* TP_*_INPUT_ATTR_IDX index into the service array BT_GATT_SERVICE_DEFINE
@@ -447,6 +542,7 @@ static int hid_passthrough_ble_init(void) {
     k_work_queue_start(&tp_hog_work_q, tp_hog_q_stack,
                        K_THREAD_STACK_SIZEOF(tp_hog_q_stack), 5, &queue_config);
 
+    tp_pace_refresh(NULL);
     hid_touchpad_register_input_cb(tp_dev, tp_ble_input_cb);
 
     LOG_INF("BLE HID passthrough initialized");

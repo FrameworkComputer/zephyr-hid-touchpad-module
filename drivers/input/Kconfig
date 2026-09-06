@@ -57,18 +57,21 @@ config HID_PASSTHROUGH_BLE
       Enable BLE HOGP passthrough for the touchpad as a second HID service.
 
 config HID_PASSTHROUGH_BLE_PACE_MS
-    int "Minimum interval between BLE PTP motion notifications (ms, 0=off)"
+    int "Fallback pace for BLE PTP motion notifications (ms, 0=off)"
     depends on HID_PASSTHROUGH_BLE
     default 10
     help
       Coalesce absolute-position (PTP) input reports so pure-motion
-      notifications go out at most once per this interval; frames whose
-      tip/confidence/contact-id/button state changed are sent immediately.
-      Keeps one frame per BLE connection event so host arrival timestamps
-      stay regular (libinput's touchpad jump detection discards motion of
-      frames that arrive back-to-back within one connection event), and
-      10 ms matches libinput's hardcoded Bluetooth velocity assumption.
-      0 disables pacing (forward every frame).
+      notifications go out at most once per BLE connection event; frames
+      whose tip/confidence/contact-id/button state changed are sent
+      immediately. Keeps host arrival timestamps regular (libinput's
+      touchpad jump detection discards motion of frames that arrive
+      back-to-back within one connection event).
+
+      The pace normally follows the connection interval the central
+      granted (interval minus 0.5 ms); this value is only used while no
+      connection info is available. 0 disables pacing entirely (forward
+      every frame).
 
 config HID_TOUCHPAD_INPUT_STATS
     bool "Log 1 Hz input-report rate and I2C read timing"
