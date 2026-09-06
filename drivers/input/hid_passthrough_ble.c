@@ -10,6 +10,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/util.h>
 
+#include <zmk/ble.h>
 #include <zmk/endpoints.h>
 
 #include "hid_touchpad.h"
@@ -220,26 +221,10 @@ struct tp_report_msg {
 
 K_MSGQ_DEFINE(tp_report_msgq, sizeof(struct tp_report_msg), 8, 4);
 
-struct conn_collect_ctx {
-    struct bt_conn *conns[CONFIG_BT_MAX_CONN];
-    int count;
-};
-
-static void collect_conn_cb(struct bt_conn *conn, void *user_data) {
-    struct conn_collect_ctx *ctx = user_data;
-    if (ctx->count < CONFIG_BT_MAX_CONN) {
-        ctx->conns[ctx->count] = bt_conn_ref(conn);
-        ctx->count++;
-    }
-}
-
 static void send_tp_report_callback(struct k_work *work) {
     struct tp_report_msg msg;
 
     while (k_msgq_get(&tp_report_msgq, &msg, K_NO_WAIT) == 0) {
-        struct conn_collect_ctx ctx = { .count = 0 };
-        bt_conn_foreach(BT_CONN_TYPE_LE, collect_conn_cb, &ctx);
-
         const struct bt_gatt_attr *attr;
         if (msg.report_id == TP_MOUSE_INPUT_REPORT_ID) {
             attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
@@ -250,29 +235,33 @@ static void send_tp_report_callback(struct k_work *work) {
             memcpy(cached_ptp_report, msg.data,
                    MIN(msg.len, sizeof(cached_ptp_report)));
         } else {
-            for (int i = 0; i < ctx.count; i++) {
-                bt_conn_unref(ctx.conns[i]);
-            }
             continue;
         }
 
-        for (int i = 0; i < ctx.count; i++) {
-            struct bt_gatt_notify_params notify_params = {
-                .attr = attr,
-                .data = msg.data,
-                .len = msg.len,
-            };
-
-            int err = bt_gatt_notify_cb(ctx.conns[i], &notify_params);
-            if (err == -EPERM) {
-                bt_conn_set_security(ctx.conns[i], BT_SECURITY_L2);
-            } else if (err) {
-                /* WRN: a failed notify is a dropped frame (e.g. -ENOMEM =
-                 * ATT TX buffer exhaustion, -ENOTCONN/-EINVAL = no CCC). */
-                LOG_WRN("Error notifying %d", err);
-            }
-            bt_conn_unref(ctx.conns[i]);
+        /* Notify only the central for the currently selected BLE profile, mirroring
+         * ZMK's keyboard HOG (zmk_ble_active_profile_conn). Fanning out to every
+         * connected LE central would mirror the pad to all bonded hosts at once. */
+        struct bt_conn *conn = zmk_ble_active_profile_conn();
+        if (conn == NULL) {
+            continue;
         }
+
+        struct bt_gatt_notify_params notify_params = {
+            .attr = attr,
+            .data = msg.data,
+            .len = msg.len,
+        };
+
+        int err = bt_gatt_notify_cb(conn, &notify_params);
+        if (err == -EPERM) {
+            bt_conn_set_security(conn, BT_SECURITY_L2);
+        } else if (err) {
+            /* WRN: a failed notify is a dropped frame (e.g. -ENOMEM =
+             * ATT TX buffer exhaustion, -ENOTCONN/-EINVAL = no CCC). */
+            LOG_WRN("Error notifying %d", err);
+        }
+
+        bt_conn_unref(conn);
     }
 }
 
