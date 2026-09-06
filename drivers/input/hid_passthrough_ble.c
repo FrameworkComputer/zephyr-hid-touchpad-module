@@ -391,6 +391,19 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
                                 now ? K_NO_WAIT : K_MSEC(due));
 }
 
+/* TP_*_INPUT_ATTR_IDX index into the service array BT_GATT_SERVICE_DEFINE
+ * builds, and any edit above the input characteristics silently shifts
+ * them: notifications would then go out on the wrong characteristic with
+ * no error. A BUILD_ASSERT can't see into that array, so check at init.
+ * The UUID alone can't tell mouse from PTP; the read callback can. */
+static bool tp_input_attr_ok(size_t idx, bt_gatt_attr_read_func_t read) {
+    if (idx >= tp_hog_svc.attr_count) {
+        return false;
+    }
+    const struct bt_gatt_attr *attr = &tp_hog_svc.attrs[idx];
+    return bt_uuid_cmp(attr->uuid, BT_UUID_HIDS_REPORT) == 0 && attr->read == read;
+}
+
 static int hid_passthrough_ble_init(void) {
     /* The GATT service is registered statically whatever happens here, so a
      * pad that failed init still shows up to the host. Leave tp_dev NULL in
@@ -404,6 +417,15 @@ static int hid_passthrough_ble_init(void) {
         return 0;
     }
     tp_dev = dev;
+
+    if (!tp_input_attr_ok(TP_MOUSE_INPUT_ATTR_IDX, read_mouse_input_report) ||
+        !tp_input_attr_ok(TP_PTP_INPUT_ATTR_IDX, read_ptp_input_report)) {
+        /* Leave the input callback unregistered: the pad keeps working over
+         * USB rather than notifying garbage on some other characteristic. */
+        LOG_ERR("Input report attribute indices don't match the service layout, "
+                "BLE passthrough disabled");
+        return 0;
+    }
 
     static const struct k_work_queue_config queue_config = {
         .name = "TP HOG Send Work"
