@@ -18,9 +18,14 @@ extern "C" {
 /* I2C HID protocol constants */
 #define I2C_HID_SET_REPORT      0x03
 #define I2C_HID_GET_REPORT      0x02
+#define I2C_HID_SET_POWER       0x08
 #define I2C_HID_REPORT_TYPE_INPUT   0x10
 #define I2C_HID_REPORT_TYPE_OUTPUT  0x20
 #define I2C_HID_REPORT_TYPE_FEATURE 0x30
+
+/* SET_POWER power states (HID over I2C spec 1.00; 2 and 3 are reserved) */
+#define I2C_HID_PWR_ON    0x00
+#define I2C_HID_PWR_SLEEP 0x01
 
 /* Hardcoded report descriptor (686 bytes, from PCT1036 touchpad) */
 extern const uint8_t tp_report_desc[];
@@ -77,6 +82,20 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
  */
 int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
                             const uint8_t *data, uint16_t len);
+
+/**
+ * Issue an I2C HID SET_POWER command (I2C_HID_PWR_ON / I2C_HID_PWR_SLEEP).
+ * The device sends no response; per spec it must transition within 1 s.
+ */
+int hid_touchpad_set_power(const struct device *dev, uint8_t state);
+
+/**
+ * Read/write a raw (non-HID) 8-bit device register. For vendor-specific
+ * control flows the HID protocol doesn't cover, e.g. the PCT1036
+ * suspend/resume register sequence.
+ */
+int hid_touchpad_reg_read(const struct device *dev, uint8_t reg, uint8_t *val);
+int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val);
 
 #ifdef __cplusplus
 }

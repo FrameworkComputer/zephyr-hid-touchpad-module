@@ -149,6 +149,30 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
     }
 }
 
+int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
+    /* Command low byte carries the power state in bits [1:0], high byte the
+     * SET_POWER opcode in bits [3:0]. No response follows. */
+    uint8_t msg[4] = {data->command_reg, 0x00, state, I2C_HID_SET_POWER};
+    int err = i2c_write_dt(&config->i2c_bus, msg, sizeof(msg));
+    if (err) {
+        LOG_ERR("set_power %u failed: %d", state, err);
+    }
+    return err;
+}
+
+int hid_touchpad_reg_read(const struct device *dev, uint8_t reg, uint8_t *val) {
+    const struct hid_touchpad_config *config = dev->config;
+    return i2c_reg_read_byte_dt(&config->i2c_bus, reg, val);
+}
+
+int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
+    const struct hid_touchpad_config *config = dev->config;
+    return i2c_reg_write_byte_dt(&config->i2c_bus, reg, val);
+}
+
 void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb) {
     struct hid_touchpad_data *data = dev->data;
     if (data->num_cbs < HID_TOUCHPAD_MAX_CBS) {
