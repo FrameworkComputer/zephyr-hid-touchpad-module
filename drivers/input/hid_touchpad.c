@@ -182,11 +182,31 @@ void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input
     }
 }
 
+#ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
+/* I2C read-duration stats, reported by the 1 Hz counter in
+ * hid_touchpad_report_data. */
+static uint32_t tp_dbg_read_us_sum, tp_dbg_read_us_n, tp_dbg_read_us_max;
+#endif
+
 static int hid_touchpad_report_data(const struct device *dev) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
+#ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
+    /* Time the I2C read itself, to split "each read is slow (pad
+     * clock-stretching/wedged)" from "reads are fast but infrequent (work not
+     * scheduled)". Reported by the 1 Hz counter below. */
+    uint32_t c0 = k_cycle_get_32();
+#endif
     int err = i2c_read_dt(&config->i2c_bus, data->report_buf, data->max_input_len);
+#ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
+    uint32_t read_us = k_cyc_to_us_floor32(k_cycle_get_32() - c0);
+    tp_dbg_read_us_sum += read_us;
+    tp_dbg_read_us_n++;
+    if (read_us > tp_dbg_read_us_max) {
+        tp_dbg_read_us_max = read_us;
+    }
+#endif
     if (err) {
         LOG_ERR("failed to read input report: %d", err);
         return err;
@@ -213,9 +233,9 @@ static int hid_touchpad_report_data(const struct device *dev) {
     LOG_DBG("Report ID: %d, Len: %d", report_id, data_len);
     LOG_HEXDUMP_DBG(&data->report_buf[2], report_len - 2, "Raw report");
 
-    /* DEBUG (TP-over-BLE choppiness): 1 Hz production-rate counter, to split
-     * "TP frames read too slowly" from "frames pile up on the way out".
-     * Remove when the investigation is done. */
+#ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
+    /* 1 Hz production-rate counter, to split "TP frames read too slowly" from
+     * "frames pile up on the way out". */
     {
         static uint32_t frame_count;
         static int64_t last_report_ms;
@@ -223,11 +243,15 @@ static int hid_touchpad_report_data(const struct device *dev) {
 
         frame_count++;
         if (now - last_report_ms >= 1000) {
-            LOG_INF("tp input: %u frames in %lld ms", frame_count, now - last_report_ms);
+            uint32_t avg = tp_dbg_read_us_n ? tp_dbg_read_us_sum / tp_dbg_read_us_n : 0;
+            LOG_INF("tp input: %u frames in %lld ms, i2c read avg %u us max %u us",
+                    frame_count, now - last_report_ms, avg, tp_dbg_read_us_max);
             frame_count = 0;
             last_report_ms = now;
+            tp_dbg_read_us_sum = tp_dbg_read_us_n = tp_dbg_read_us_max = 0;
         }
     }
+#endif
 
     for (int i = 0; i < data->num_cbs; i++) {
         if (data->input_cbs[i]) {

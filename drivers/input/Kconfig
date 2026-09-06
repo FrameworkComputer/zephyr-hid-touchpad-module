@@ -70,6 +70,16 @@ config HID_PASSTHROUGH_BLE_PACE_MS
       10 ms matches libinput's hardcoded Bluetooth velocity assumption.
       0 disables pacing (forward every frame).
 
+config HID_TOUCHPAD_INPUT_STATS
+    bool "Log 1 Hz input-report rate and I2C read timing"
+    help
+      Diagnostic for touchpad frame-rate/latency investigations: once per
+      second, log how many input reports were read and the average/maximum
+      duration of the input-report I2C read. Splits "each read is slow" from
+      "reads are infrequent" from "frames pile up on the way out". Costs a
+      cycle-counter read around every I2C read and one INF log line per
+      second while the pad reports, so leave it off in production builds.
+
 module = HID_TOUCHPAD
 module-str = hid_touchpad
 source "subsys/logging/Kconfig.template.log_config"
