@@ -28,7 +28,7 @@ extern "C" {
 #define I2C_HID_PWR_ON    0x00
 #define I2C_HID_PWR_SLEEP 0x01
 
-/* Hardcoded report descriptor (686 bytes, from PCT1036 touchpad) */
+/* Report descriptor, provided by devicetree (`report-descriptor`) */
 extern const uint8_t tp_report_desc[];
 extern const size_t tp_report_desc_size;
 

@@ -160,6 +160,12 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
     if (!ref || tp_dev == NULL || !device_is_ready(tp_dev)) {
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
+    /* Known limitation: a feature SET larger than MTU-3 arrives as a
+     * prepare/execute long write (offset != 0 chunks) and is rejected here.
+     * Only the 256-byte vendor blobs (0x0A/0x41) are affected; no known tool
+     * writes those over BLE (register access uses the 3-byte reports), so
+     * reassembly isn't implemented. Reads of any size work (see the cache
+     * in read_feature_report). */
     if (offset != 0) {
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
