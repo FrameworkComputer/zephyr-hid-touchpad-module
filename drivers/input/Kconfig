@@ -32,15 +32,22 @@ config HID_TOUCHPAD_WORKQUEUE_PRIORITY
     help
       Cooperative priority (K_PRIO_COOP) of the touchpad report work queue.
 
+# The passthrough backends are ZMK-specific: they follow the keyboard's
+# endpoint selection (zmk_endpoint_get_selected), the BLE one notifies the
+# active profile's central and both include ZMK's private app/include
+# headers. Without ZMK's USB/BLE subsystems they can't compile, so they only
+# offer themselves when those are enabled; the plain driver and its
+# hid_touchpad_register_input_cb() API stay usable from any Zephyr app.
 config HID_PASSTHROUGH_USB
     bool "USB HID Passthrough for touchpad"
+    depends on ZMK_USB
     depends on USB_DEVICE_HID || USBD_HID_SUPPORT
     default y
     help
       Enable USB HID passthrough for the touchpad. Works with either the
       legacy USB device stack (CONFIG_USB_DEVICE_HID) or the new stack
       (CONFIG_USBD_HID_SUPPORT); the correct source file is selected
-      automatically based on which stack is enabled.
+      automatically based on which stack is enabled. Requires ZMK.
 
 config HID_PASSTHROUGH_USB_LEGACY
     def_bool y
@@ -52,10 +59,11 @@ config HID_PASSTHROUGH_USB_NEXT
 
 config HID_PASSTHROUGH_BLE
     bool "BLE HID Passthrough for touchpad"
-    depends on BT
+    depends on ZMK_BLE
     default y
     help
-      Enable BLE HOGP passthrough for the touchpad as a second HID service.
+      Enable BLE HOGP passthrough for the touchpad as a second HID service,
+      notifying the central of ZMK's active profile. Requires ZMK.
 
 config HID_PASSTHROUGH_BLE_PACE_MS
     int "Fallback pace for BLE PTP motion notifications (ms, 0=off)"
