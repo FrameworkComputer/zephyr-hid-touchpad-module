@@ -75,9 +75,12 @@ no ZMK dependency and can feed any other consumer.
 
 Other options: `HID_PASSTHROUGH_BLE_PACE_MS` (fallback pace for PTP
 notifications; normally derived from the granted connection interval),
-`HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE`, `HID_TOUCHPAD_WORKQUEUE_*`, and
-`HID_TOUCHPAD_INPUT_STATS` (1 Hz frame-rate / I2C timing diagnostic, off by
-default).
+`HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE` (default y: BLE feature GET responses
+carry one trailing dummy byte, so BlueZ <= 5.87, whose uhid bridge drops the
+last byte of every numbered GET_REPORT reply, still delivers the full report;
+fixed hosts discard the extra byte), `HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE`,
+`HID_TOUCHPAD_WORKQUEUE_*`, and `HID_TOUCHPAD_INPUT_STATS` (1 Hz frame-rate /
+I2C timing diagnostic, off by default).
 
 ## Using it in a west workspace
 

@@ -92,6 +92,24 @@ config HID_PASSTHROUGH_BLE_PACE_MS
       connection info is available. 0 disables pacing entirely (forward
       every frame).
 
+config HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE
+    bool "Append one dummy byte to BLE feature GET responses (BlueZ workaround)"
+    depends on HID_PASSTHROUGH_BLE
+    default y
+    help
+      bluetoothd up to and including BlueZ 5.87 drops the last byte of
+      every numbered HID GET_REPORT reply from a HoG device
+      (src/shared/uhid.c bt_uhid_get_report_reply prepends the report ID
+      but does not count it). A one-byte feature such as the PTP input
+      mode or contact-count maximum then reads back as 0, and register
+      access protocols that put the value in the last byte break.
+
+      With this option the Report characteristic's read value is the
+      pad's feature data plus one trailing 0x00, so the truncated host
+      still receives the complete report. Fixed hosts are unaffected:
+      Linux uhid/hidraw copy at most the caller's requested length, so
+      the extra byte is discarded. Feature SETs are not changed.
+
 config HID_TOUCHPAD_INPUT_STATS
     bool "Log 1 Hz input-report rate and I2C read timing"
     help

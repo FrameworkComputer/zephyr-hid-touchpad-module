@@ -146,6 +146,16 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
         feature_buf_len = out_len;
         feature_buf_id = ref->id;
 
+        /* BlueZ <= 5.87 drops the last byte of every numbered GET_REPORT
+         * reply (bt_uhid_get_report_reply). Hand out one trailing dummy
+         * byte so that host still delivers the whole report; a correct
+         * host copies only what the caller asked for and never sees it.
+         * feature_buf has 8 bytes of slack past the 256-byte maximum. */
+        if (IS_ENABLED(CONFIG_HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE) &&
+            feature_buf_len < sizeof(feature_buf)) {
+            feature_buf[feature_buf_len++] = 0x00;
+        }
+
         LOG_DBG("BLE feature id=%u returned %u bytes (first: 0x%02x)",
                 ref->id, out_len, out_len > 0 ? feature_buf[0] : 0);
     }
