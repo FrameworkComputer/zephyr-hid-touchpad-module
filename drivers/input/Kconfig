@@ -88,9 +88,33 @@ config HID_PASSTHROUGH_BLE_PACE_MS
       back-to-back within one connection event).
 
       The pace normally follows the connection interval the central
-      granted (interval minus 0.5 ms); this value is only used while no
-      connection info is available. 0 disables pacing entirely (forward
-      every frame).
+      granted, plus HID_PASSTHROUGH_BLE_PACE_MARGIN_US; this value is only
+      used while no connection info is available. 0 disables pacing
+      entirely (forward every frame).
+
+config HID_PASSTHROUGH_BLE_PACE_MARGIN_US
+    int "Margin added to the granted connection interval for the PTP pace (us)"
+    depends on HID_PASSTHROUGH_BLE
+    default 500
+    help
+      How far ABOVE the granted connection interval to pace PTP motion
+      notifications. The pace must exceed the interval for coalescing to
+      happen at all: a pad that reports faster than the event grid (the
+      140 Hz firmware reports every 7.10 ms against 7.5 ms events) puts its
+      surplus frames into one connection event as burst-mates, whose motion
+      libinput's jump detection discards. Pacing above the interval spends
+      those frames in the driver instead, where dropping them is free
+      because PTP positions are absolute.
+
+      The cost is one connection event in interval/margin carrying no new
+      frame: a 15 ms arrival gap with normal single-frame travel, which is
+      benign. At the 7.5 ms both our centrals grant, 500 us gives one such
+      gap every 15 frames and 125 frames/s delivered; 250 us gives one
+      every 30 and 129 frames/s.
+
+      Too small and send-path scheduling jitter lands two sends in one
+      event again, which is the artifact being fixed, so lower it only with
+      an arrival histogram to show 0% of arrivals under 2 ms.
 
 config HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE
     bool "Append one dummy byte to BLE feature GET responses (BlueZ workaround)"

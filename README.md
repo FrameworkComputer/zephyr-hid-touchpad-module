@@ -74,7 +74,8 @@ plain driver and its `hid_touchpad_register_input_cb()` callback API have
 no ZMK dependency and can feed any other consumer.
 
 Other options: `HID_PASSTHROUGH_BLE_PACE_MS` (fallback pace for PTP
-notifications; normally derived from the granted connection interval),
+notifications; normally the granted connection interval plus
+`HID_PASSTHROUGH_BLE_PACE_MARGIN_US`),
 `HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE` (default y: BLE feature GET responses
 carry one trailing dummy byte, so BlueZ <= 5.87, whose uhid bridge drops the
 last byte of every numbered GET_REPORT reply, still delivers the full report;

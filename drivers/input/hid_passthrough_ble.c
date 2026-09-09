@@ -280,20 +280,42 @@ K_MSGQ_DEFINE(tp_report_msgq, sizeof(struct tp_report_msg), 8, 4);
  * button changes skip the pacing so tap/click latency is unaffected.
  *
  * The pace follows the interval the central actually granted (refreshed
- * from the active profile's connection, see tp_pace_refresh), minus a
- * small margin so scheduling jitter can't land two sends in one event. A
- * fixed pace that doesn't divide the interval quantizes onto the event
- * grid as a beat: 10 ms sends on the 7.5 ms both our centrals grant went
- * on air 15/7.5/7.5 ms apart with every third frame carrying double
- * travel. At 7.5 ms the pace (7.0 ms) sits below the pad period (~7.6 ms
- * in Run), so nothing is coalesced and every pad frame gets its own event;
- * at >= 10 ms grants pacing re-engages and coalesces regularly. The
- * Kconfig value is only the fallback when no connection info is available
- * (0 turns pacing off entirely). Arithmetic is in ticks: 7.5 ms is not
- * expressible in ms and a 0.5 ms/frame error would be the beat again. */
+ * from the active profile's connection, see tp_pace_refresh), plus a small
+ * margin. A fixed pace that doesn't divide the interval quantizes onto the
+ * event grid as a beat: 10 ms sends on the 7.5 ms both our centrals grant
+ * went on air 15/7.5/7.5 ms apart with every third frame carrying double
+ * travel.
+ *
+ * The margin is ADDED, not subtracted, and that sign is the whole point:
+ * the pace has to sit ABOVE the granted interval for the gate to do
+ * anything. Sends spaced interval+margin apart always land on distinct
+ * connection events, because each send waits for the next anchor and the
+ * spacing exceeds the anchor spacing, so the anchor index strictly
+ * increases. Spacing it BELOW the interval (the original interval - 0.5 ms)
+ * only worked while the pad was the slower party: against a 7.0 ms deadline
+ * the 140 Hz firmware's 7.10 ms frames each arrive after their deadline has
+ * already passed, so the gate never fires and all 141 frames/s go to a link
+ * that can place 133 of them on distinct events. The surplus leaves as
+ * burst-mates and the ACL TX queue becomes the buffer -- measured over the
+ * dongle as 8.9% of arrivals under 2 ms and 3.9% of events carrying nothing
+ * (aster issues/touchpad-140hz-outruns-connection-events.md).
+ *
+ * Cost of the margin: sends drift one whole event later every
+ * interval/margin frames, so one connection event in that many carries no
+ * new frame -- a 15 ms arrival gap with normal single-frame travel, which
+ * is benign (libinput computes a velocity from it and moves on) where a
+ * burst-mate is not (its motion is discarded outright). At 7.5 ms + 0.5 ms
+ * that is one gap every 15 frames and 125 frames/s delivered. Trading
+ * delivered rate for regularity is the deal libinput's jump detection
+ * forces on us; the margin is the dial, and it must stay above the
+ * send-path scheduling jitter or the doubles come back.
+ *
+ * The Kconfig pace is only the fallback when no connection info is
+ * available (0 turns pacing off entirely). Arithmetic is in ticks: 7.5 ms
+ * is not expressible in ms and a 0.5 ms/frame error would be the beat
+ * again. */
 #define TP_PACE_FALLBACK_US (CONFIG_HID_PASSTHROUGH_BLE_PACE_MS * 1000)
-#define TP_PACE_MARGIN_US   500
-#define TP_PACE_MIN_US      2000
+#define TP_PACE_MARGIN_US   CONFIG_HID_PASSTHROUGH_BLE_PACE_MARGIN_US
 #define TP_PACE_ENABLED     (CONFIG_HID_PASSTHROUGH_BLE_PACE_MS > 0)
 
 static struct tp_report_msg tp_pending;
@@ -354,7 +376,7 @@ static void tp_pace_refresh(struct bt_conn *conn) {
     if (conn != NULL && bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE &&
         info.le.interval_us > 0) {
         interval_us = info.le.interval_us;
-        pace_us = MAX(interval_us - TP_PACE_MARGIN_US, TP_PACE_MIN_US);
+        pace_us = interval_us + TP_PACE_MARGIN_US;
     }
 
     k_ticks_t ticks = TP_PACE_ENABLED ? k_us_to_ticks_ceil64(pace_us) : 0;
