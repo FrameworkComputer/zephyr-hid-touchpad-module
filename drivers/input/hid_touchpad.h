@@ -63,6 +63,23 @@ struct hid_touchpad_data {
 void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb);
 
 /**
+ * Feed a synthetic input report to every registered callback, exactly as if
+ * the pad had produced it: same callbacks, same order, same endpoint
+ * selection and BLE pacing downstream. Nothing is sent to the pad over I2C,
+ * so it works whether or not a physical pad answers.
+ *
+ * For end-to-end tests of the passthrough path (see the Daisy factory
+ * protocol's TOUCHPAD_INJECT_* commands). `report_id` must be one the
+ * report descriptor declares, or the backends drop the frame.
+ *
+ * Callable from any thread context. The callbacks are the real ones, so the
+ * USB backend can block on its TX semaphore for up to its own timeout --
+ * don't call this from an ISR or a latency-critical callback.
+ */
+void hid_touchpad_inject_input(const struct device *dev, uint8_t report_id,
+                               const uint8_t *data, uint16_t len);
+
+/**
  * Get a feature/input report from the touchpad via I2C HID protocol.
  * @param type Report type (I2C_HID_REPORT_TYPE_FEATURE, etc.)
  * @param id   Report ID

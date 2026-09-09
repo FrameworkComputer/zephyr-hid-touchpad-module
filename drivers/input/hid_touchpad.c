@@ -222,6 +222,26 @@ void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input
     }
 }
 
+/* Fan one input report out to the registered passthrough backends. Shared by
+ * the I2C read path and hid_touchpad_inject_input() so a synthetic frame is
+ * indistinguishable from a real one downstream. */
+static void tp_dispatch_input(const struct device *dev, uint8_t report_id, const uint8_t *data,
+                              uint16_t len) {
+    const struct hid_touchpad_data *tp = dev->data;
+
+    for (int i = 0; i < tp->num_cbs; i++) {
+        if (tp->input_cbs[i]) {
+            tp->input_cbs[i](dev, report_id, data, len);
+        }
+    }
+}
+
+void hid_touchpad_inject_input(const struct device *dev, uint8_t report_id, const uint8_t *data,
+                               uint16_t len) {
+    LOG_DBG("inject report id=%u len=%u", report_id, len);
+    tp_dispatch_input(dev, report_id, data, len);
+}
+
 #ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
 /* I2C read-duration stats, reported by the 1 Hz counter in
  * hid_touchpad_report_data. */
@@ -293,11 +313,7 @@ static int hid_touchpad_report_data(const struct device *dev) {
     }
 #endif
 
-    for (int i = 0; i < data->num_cbs; i++) {
-        if (data->input_cbs[i]) {
-            data->input_cbs[i](dev, report_id, &data->report_buf[3], data_len);
-        }
-    }
+    tp_dispatch_input(dev, report_id, &data->report_buf[3], data_len);
     return 0;
 }
 
