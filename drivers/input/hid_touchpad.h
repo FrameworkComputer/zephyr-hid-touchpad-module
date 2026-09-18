@@ -53,6 +53,11 @@ struct hid_touchpad_data {
     hid_touchpad_input_cb_t input_cbs[HID_TOUCHPAD_MAX_CBS];
     uint8_t num_cbs;
     uint8_t report_buf[64];
+    /* Serialises every I2C transaction the driver issues (input reads,
+     * GET/SET_REPORT, SET_POWER, raw registers). */
+    struct k_mutex lock;
+    /* Thread holding an exclusive claim (hid_touchpad_claim), or NULL. */
+    k_tid_t claim_owner;
 };
 
 /**
@@ -119,6 +124,45 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state);
  */
 int hid_touchpad_reg_read(const struct device *dev, uint8_t reg, uint8_t *val);
 int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val);
+
+/**
+ * Take exclusive ownership of the pad for a multi-transaction sequence
+ * (e.g. a firmware update, where a 256-byte burst write must not be
+ * interleaved with anything else).
+ *
+ * While claimed:
+ *  - every driver call from a thread other than the owner fails with -EBUSY
+ *    immediately -- a host blocked on a USB control transfer must never
+ *    stall behind the owner's work;
+ *  - the DR interrupt is disabled and the input work item is cancelled, so
+ *    the driver's own input-report reads stop too. Input resumes on release;
+ *    a report that went ready meanwhile is drained then (DR is
+ *    edge-triggered and would otherwise never fire again).
+ *
+ * @param timeout How long to wait for an in-flight transaction to finish.
+ * @return 0, -EALREADY if already claimed, or the k_mutex_lock error
+ *         (-EBUSY for K_NO_WAIT, -EAGAIN on timeout).
+ *
+ * Must not be called from the driver's own work queue (it waits for that
+ * queue's work item to finish).
+ */
+int hid_touchpad_claim(const struct device *dev, k_timeout_t timeout);
+
+/**
+ * Give the pad back. Re-arms the DR interrupt and drains a pending report.
+ * @return 0, or -EPERM when the caller does not hold the claim.
+ */
+int hid_touchpad_release(const struct device *dev);
+
+/**
+ * Re-read the I2C HID descriptor and refresh command_reg / data_reg /
+ * max_input_len from it. Needed after anything that reboots the pad's HID
+ * stack (a vendor reset into bootloader or application mode): the
+ * registers are only guaranteed for the descriptor they came from. Retries
+ * for up to ~1 s while the pad comes back. Subject to the claim like every
+ * other call.
+ */
+int hid_touchpad_reinit_descriptor(const struct device *dev);
 
 #ifdef __cplusplus
 }

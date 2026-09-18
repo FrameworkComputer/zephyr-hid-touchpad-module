@@ -61,6 +61,33 @@ static struct k_work_q tp_workq;
  * is resubmitted instead. */
 #define TP_DRAIN_BURST 8
 
+/* Every I2C transaction goes through tp_lock()/tp_unlock(). The mutex keeps
+ * transactions from interleaving (the USB control thread, the BLE work
+ * queue, the factory protocol and our own input reads all talk to the same
+ * pad); the claim owner check on top makes hid_touchpad_claim() exclusive
+ * without the owner having to hold the mutex for seconds, which would leave
+ * the other callers blocked instead of failing fast. The owner is checked
+ * again after the lock is taken so a caller that raced past the first check
+ * while a claim was being set up still backs off. */
+static int tp_lock(struct hid_touchpad_data *data) {
+    k_tid_t owner = data->claim_owner;
+    if (owner != NULL && owner != k_current_get()) {
+        return -EBUSY;
+    }
+    int err = k_mutex_lock(&data->lock, K_FOREVER);
+    if (err) {
+        return err;
+    }
+    owner = data->claim_owner;
+    if (owner != NULL && owner != k_current_get()) {
+        k_mutex_unlock(&data->lock);
+        return -EBUSY;
+    }
+    return 0;
+}
+
+static void tp_unlock(struct hid_touchpad_data *data) { k_mutex_unlock(&data->lock); }
+
 int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
                             uint8_t *buf, uint16_t buf_len, uint16_t *out_len) {
     struct hid_touchpad_data *data = dev->data;
@@ -109,7 +136,12 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
         }
     }
 
-    int err = i2c_write_read_dt(&config->i2c_bus, cmd, cmd_len, i2c_buf, read_len);
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    err = i2c_write_read_dt(&config->i2c_bus, cmd, cmd_len, i2c_buf, read_len);
+    tp_unlock(data);
     if (err) {
         LOG_ERR("get_report id=%u failed: %d", id, err);
         return err;
@@ -156,7 +188,12 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
         if (len > 0) {
             memcpy(&msg[9], report_data, len);
         }
-        int err = i2c_write_dt(&config->i2c_bus, msg, 9 + len);
+        int err = tp_lock(data);
+        if (err) {
+            return err;
+        }
+        err = i2c_write_dt(&config->i2c_bus, msg, 9 + len);
+        tp_unlock(data);
         if (err) {
             LOG_ERR("set_report failed: %d", err);
         }
@@ -181,7 +218,12 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
             memcpy(&msg[10], report_data, len);
         }
         LOG_HEXDUMP_DBG(msg, 10 + len, "set_report ext I2C write");
-        int err = i2c_write_dt(&config->i2c_bus, msg, 10 + len);
+        int err = tp_lock(data);
+        if (err) {
+            return err;
+        }
+        err = i2c_write_dt(&config->i2c_bus, msg, 10 + len);
+        tp_unlock(data);
         if (err) {
             LOG_ERR("set_report (ext) failed: %d", err);
         }
@@ -196,7 +238,12 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
     /* Command low byte carries the power state in bits [1:0], high byte the
      * SET_POWER opcode in bits [3:0]. No response follows. */
     uint8_t msg[4] = {data->command_reg, 0x00, state, I2C_HID_SET_POWER};
-    int err = i2c_write_dt(&config->i2c_bus, msg, sizeof(msg));
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    err = i2c_write_dt(&config->i2c_bus, msg, sizeof(msg));
+    tp_unlock(data);
     if (err) {
         LOG_ERR("set_power %u failed: %d", state, err);
     }
@@ -204,13 +251,27 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
 }
 
 int hid_touchpad_reg_read(const struct device *dev, uint8_t reg, uint8_t *val) {
+    struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
-    return i2c_reg_read_byte_dt(&config->i2c_bus, reg, val);
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    err = i2c_reg_read_byte_dt(&config->i2c_bus, reg, val);
+    tp_unlock(data);
+    return err;
 }
 
 int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
+    struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
-    return i2c_reg_write_byte_dt(&config->i2c_bus, reg, val);
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    err = i2c_reg_write_byte_dt(&config->i2c_bus, reg, val);
+    tp_unlock(data);
+    return err;
 }
 
 void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb) {
@@ -258,7 +319,13 @@ static int hid_touchpad_report_data(const struct device *dev) {
      * scheduled)". Reported by the 1 Hz counter below. */
     uint32_t c0 = k_cycle_get_32();
 #endif
-    int err = i2c_read_dt(&config->i2c_bus, data->report_buf, data->max_input_len);
+    int err = tp_lock(data);
+    if (err) {
+        /* Claimed: the owner disabled DR and will drain on release. */
+        return err;
+    }
+    err = i2c_read_dt(&config->i2c_bus, data->report_buf, data->max_input_len);
+    tp_unlock(data);
 #ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
     uint32_t read_us = k_cyc_to_us_floor32(k_cycle_get_32() - c0);
     tp_dbg_read_us_sum += read_us;
@@ -357,26 +424,71 @@ static void hid_touchpad_gpio_cb(const struct device *port, struct gpio_callback
     k_work_submit_to_queue(&tp_workq, &data->work);
 }
 
-static int hid_touchpad_init(const struct device *dev) {
+/* Enable the DR interrupt and, if a report is already pending, drain it:
+ * DR is asserted right now and the edge-triggered interrupt will never fire
+ * for it. Shared by init, PM resume and hid_touchpad_release(). */
+static int tp_arm_dr(const struct device *dev) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
-    if (!device_is_ready(config->i2c_bus.bus)) {
-        LOG_WRN("i2c bus not ready!");
-        return -EINVAL;
+    int ret = set_int(dev, true);
+    if (ret == 0 && gpio_pin_get_dt(&config->dr) > 0) {
+        k_work_submit_to_queue(&tp_workq, &data->work);
     }
+    return ret;
+}
 
-    int err = i2c_recover_bus(config->i2c_bus.bus);
+int hid_touchpad_claim(const struct device *dev, k_timeout_t timeout) {
+    struct hid_touchpad_data *data = dev->data;
+
+    /* Take the mutex only to publish ourselves as owner atomically with
+     * respect to an in-flight transaction; from then on tp_lock() turns every
+     * other thread away, so we don't need to keep holding it. Not holding it
+     * also makes the k_work_cancel_sync() below deadlock-free: a work item
+     * that passed the owner check before we set it is blocked on the mutex,
+     * gets it, does its one read, sees the owner on its next pass and exits. */
+    int err = k_mutex_lock(&data->lock, timeout);
     if (err) {
-        LOG_WRN("I2C bus recovery failed or not supported: %d", err);
+        return err;
     }
+    if (data->claim_owner != NULL) {
+        k_mutex_unlock(&data->lock);
+        return -EALREADY;
+    }
+    data->claim_owner = k_current_get();
+    k_mutex_unlock(&data->lock);
 
-    /* Read 30-byte I2C HID descriptor from configured register. Retry with
-     * delay because an external enable rail may still be ramping or the
-     * panel firmware may still be booting during POST_KERNEL — external
-     * startup-delay can't be relied on across init-priority boundaries. */
+    set_int(dev, false);
+    struct k_work_sync sync;
+    k_work_cancel_sync(&data->work, &sync);
+    LOG_DBG("claimed by %p", data->claim_owner);
+    return 0;
+}
+
+int hid_touchpad_release(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+
+    if (data->claim_owner != k_current_get()) {
+        return -EPERM;
+    }
+    data->claim_owner = NULL;
+    LOG_DBG("released");
+    return tp_arm_dr(dev);
+}
+
+/* Read the 30-byte I2C HID descriptor from the configured register and
+ * refresh the register addresses we derive from it. Retries with delay
+ * because an external enable rail may still be ramping or the pad firmware
+ * may still be booting (at POST_KERNEL init, or right after a vendor reset)
+ * — external startup-delay can't be relied on across init-priority
+ * boundaries. Caller holds the lock (or is in init, before anyone else can
+ * call). */
+static int tp_read_descriptor(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
     uint8_t hid_desc[30] = {0};
-    err = -EIO;
+    int err = -EIO;
     for (int attempt = 0; attempt < 10 && err != 0; attempt++) {
         if (attempt > 0) {
             k_msleep(100);
@@ -423,6 +535,43 @@ static int hid_touchpad_init(const struct device *dev) {
      * with a plain read (no register address). Log it for reference only. */
     LOG_INF("command_reg=0x%02x data_reg=0x%02x input_reg=0x%04x max_input_len=%d",
             data->command_reg, data->data_reg, sys_get_le16(&hid_desc[8]), data->max_input_len);
+    return 0;
+}
+
+int hid_touchpad_reinit_descriptor(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    err = tp_read_descriptor(dev);
+    tp_unlock(data);
+    return err;
+}
+
+static int hid_touchpad_init(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
+    /* Before anything that could fail: a not-ready device must still have a
+     * usable mutex in case a caller ignores device_is_ready(). */
+    k_mutex_init(&data->lock);
+    data->claim_owner = NULL;
+
+    if (!device_is_ready(config->i2c_bus.bus)) {
+        LOG_WRN("i2c bus not ready!");
+        return -EINVAL;
+    }
+
+    int err = i2c_recover_bus(config->i2c_bus.bus);
+    if (err) {
+        LOG_WRN("I2C bus recovery failed or not supported: %d", err);
+    }
+
+    err = tp_read_descriptor(dev);
+    if (err) {
+        return err;
+    }
 
     /* Do NOT disable PTP — let the OS control input mode via feature reports */
 
@@ -458,13 +607,7 @@ static int hid_touchpad_init(const struct device *dev) {
         return -EIO;
     }
 
-    set_int(dev, true);
-
-    /* If a report is already pending, DR is asserted right now and the
-     * edge-triggered interrupt will never fire for it — drain it once. */
-    if (gpio_pin_get_dt(&config->dr) > 0) {
-        k_work_submit_to_queue(&tp_workq, &data->work);
-    }
+    tp_arm_dr(dev);
 
     LOG_INF("HID touchpad passthrough initialized at 0x%x", config->i2c_bus.addr);
 
@@ -474,22 +617,14 @@ static int hid_touchpad_init(const struct device *dev) {
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
 static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_action action) {
-    struct hid_touchpad_data *data = dev->data;
-    const struct hid_touchpad_config *config = dev->config;
-
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
         return set_int(dev, false);
-    case PM_DEVICE_ACTION_RESUME: {
-        int ret = set_int(dev, true);
+    case PM_DEVICE_ACTION_RESUME:
         /* A report that became ready while suspended holds DR asserted, and
-         * the edge-triggered interrupt never fires for it — drain it once,
-         * same as init does. */
-        if (ret == 0 && gpio_pin_get_dt(&config->dr) > 0) {
-            k_work_submit_to_queue(&tp_workq, &data->work);
-        }
-        return ret;
-    }
+         * the edge-triggered interrupt never fires for it — tp_arm_dr drains
+         * it once, same as init does. */
+        return tp_arm_dr(dev);
     default:
         return -ENOTSUP;
     }
