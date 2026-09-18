@@ -134,6 +134,16 @@ config HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE
       Linux uhid/hidraw copy at most the caller's requested length, so
       the extra byte is discarded. Feature SETs are not changed.
 
+config HID_TOUCHPAD_PIXART_UPDATE
+    bool "PixArt PJP360 firmware update protocol"
+    help
+      Compile pixart_tp_update.c: the PixArt touchpad flash protocol
+      (fwupd plugins/pixart-tp, ported) driven from the keyboard MCU over
+      the pad's vendor feature reports 0x41-0x43. Gives a board the
+      pixart_tp_read_info()/pixart_tp_update() API to carry the pad's
+      firmware in its own image and converge the pad to it. Policy (when to
+      flash, power gating, factory hooks) lives in the board, not here.
+
 config HID_TOUCHPAD_INPUT_STATS
     bool "Log 1 Hz input-report rate and I2C read timing"
     help

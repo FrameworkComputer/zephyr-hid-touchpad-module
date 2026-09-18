@@ -83,6 +83,35 @@ fixed hosts discard the extra byte), `HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE`,
 `HID_TOUCHPAD_WORKQUEUE_*`, and `HID_TOUCHPAD_INPUT_STATS` (1 Hz frame-rate /
 I2C timing diagnostic, off by default).
 
+## Exclusive access and firmware update
+
+Every I2C transaction the driver issues is serialised by one mutex. For a
+long multi-transaction sequence a caller can take the pad exclusively:
+
+```c
+hid_touchpad_claim(dev, K_MSEC(100));   /* other callers now get -EBUSY */
+/* ... */
+hid_touchpad_release(dev);              /* re-arms DR, drains a pending report */
+```
+
+While claimed, the driver's own input reads stop too, and any other thread's
+GET/SET_REPORT fails immediately with `-EBUSY` rather than blocking, so a
+host waiting on a USB control transfer is never stalled for seconds.
+`hid_touchpad_reinit_descriptor()` re-reads the I2C HID descriptor after
+anything that reboots the pad's HID stack.
+
+`CONFIG_HID_TOUCHPAD_PIXART_UPDATE` builds `pixart_tp_update.c`, a port of
+fwupd's `plugins/pixart-tp` flash protocol for the PixArt PJP360, so a board
+can carry the pad's firmware in its own image and converge the pad to it:
+
+```c
+struct pixart_tp_info info;
+pixart_tp_read_info(dev, &info);        /* part ID, boot status, version */
+pixart_tp_update(dev, &image, progress_cb, user);   /* seconds; claims the pad */
+```
+
+Policy (when to flash, power gating, factory hooks) belongs to the board.
+
 ## Using it in a west workspace
 
 ```yaml
