@@ -41,7 +41,8 @@ struct hid_touchpad_config {
 typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report_id,
                                         const uint8_t *data, uint16_t len);
 
-#define HID_TOUCHPAD_MAX_CBS 2
+/* USB + BLE passthroughs, plus one for the application (daisy's activity hook). */
+#define HID_TOUCHPAD_MAX_CBS 3
 
 struct hid_touchpad_data {
     const struct device *dev;
