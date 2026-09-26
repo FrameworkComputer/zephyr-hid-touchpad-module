@@ -96,6 +96,22 @@ int pixart_tp_read_info(const struct device *dev, struct pixart_tp_info *info);
 int pixart_tp_update(const struct device *dev, const struct pixart_tp_fw_image *img,
                      pixart_tp_progress_cb_t cb, void *user);
 
+/**
+ * Write the touchpad node's pixart,max-report-rate / pixart,rest1-frame-rate
+ * / pixart,rest2-frame-rate into the pad's user registers and read them
+ * back. CONFIG_HID_TOUCHPAD_PIXART_RATES runs this at boot and after every
+ * pixart_tp_update(); a board only needs to call it after something else
+ * that resets the pad (the registers are RAM, reloaded from the firmware's
+ * parameter section at pad boot).
+ *
+ * Claims the pad for the duration, so it fails with -EBUSY/-EALREADY while
+ * someone else holds it.
+ *
+ * @return 0, -EIO when a register does not read back as written, or the
+ *         driver's error. 0 without touching the pad when no rate is set.
+ */
+int pixart_tp_apply_rates(const struct device *dev);
+
 #ifdef __cplusplus
 }
 #endif

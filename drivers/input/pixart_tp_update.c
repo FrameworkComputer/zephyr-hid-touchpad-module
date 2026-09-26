@@ -19,9 +19,14 @@
  * carries the value in the last byte. fwupd sleeps 10 ms between the two
  * because a USB HID round trip needs it; over I2C-HID a GET is one
  * write-read transaction and the pad clock-stretches as needed.
+ *
+ * The same user-register access also sets the pad's report and idle frame
+ * rates from devicetree (pixart_tp_apply_rates()), overriding the values
+ * the firmware's parameter section loads at pad boot.
  */
 
 #include <string.h>
+#include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 
@@ -90,6 +95,12 @@ LOG_MODULE_REGISTER(pixart_tp_update, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
 #define CRC_CTRL_FW_BANK0 0x02
 #define CRC_CTRL_PARAM_BANK0 0x04
 #define CRC_CTRL_BUSY 0x01
+/* Not in fu-pixart-tp.rs: names from PixArt PTHIDUtility's register table
+ * for this part (pjp360userregistertable.xml). */
+#define REG_USER0_OBS_REPORT_RATE 0x10  /* u16 LE, read-only */
+#define REG_USER0_MAX_REPORT_RATE 0x12  /* u16 LE; firmware params set the low byte only */
+#define REG_USER0_REST1_FRAME_RATE 0x1c /* Hz */
+#define REG_USER0_REST2_FRAME_RATE 0x1d /* Hz */
 
 /* Quirk [PIXARTTP\PARTID_0360]: PixartTpSramSelect = 0x00. The fwupd base
  * class defaults to 0x0F; that is NOT what runs against this part. */
@@ -246,6 +257,100 @@ int pixart_tp_read_info(const struct device *dev, struct pixart_tp_info *info) {
     hid_touchpad_release(dev);
     return err;
 }
+
+/* --- report / frame rates from devicetree ---------------------------------- */
+
+#define TP_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(zmk_hid_touchpad)
+
+/* 0 = property absent: keep the value the firmware's parameter section set.
+ * Only the low byte of MAX_REPORT_RATE is written, as the parameter section
+ * does, so every rate must fit in one. */
+#define RATE_PROP(prop) DT_PROP_OR(TP_NODE, prop, 0)
+#define RATE_PROP_VALID(prop) IN_RANGE(DT_PROP_OR(TP_NODE, prop, 1), 1, 255)
+BUILD_ASSERT(RATE_PROP_VALID(pixart_max_report_rate), "pixart,max-report-rate must be 1-255 Hz");
+BUILD_ASSERT(RATE_PROP_VALID(pixart_rest1_frame_rate), "pixart,rest1-frame-rate must be 1-255 Hz");
+BUILD_ASSERT(RATE_PROP_VALID(pixart_rest2_frame_rate), "pixart,rest2-frame-rate must be 1-255 Hz");
+
+static const struct {
+    uint8_t reg;
+    uint8_t hz;
+    const char *name;
+} rates[] = {
+    {REG_USER0_MAX_REPORT_RATE, RATE_PROP(pixart_max_report_rate), "max report rate"},
+    {REG_USER0_REST1_FRAME_RATE, RATE_PROP(pixart_rest1_frame_rate), "rest1 frame rate"},
+    {REG_USER0_REST2_FRAME_RATE, RATE_PROP(pixart_rest2_frame_rate), "rest2 frame rate"},
+};
+
+#define ANY_RATE_SET                                                                               \
+    (RATE_PROP(pixart_max_report_rate) || RATE_PROP(pixart_rest1_frame_rate) ||                    \
+     RATE_PROP(pixart_rest2_frame_rate))
+
+static int apply_rates_locked(const struct device *dev) {
+    for (size_t i = 0; i < ARRAY_SIZE(rates); i++) {
+        if (!rates[i].hz) {
+            continue;
+        }
+        uint8_t got;
+        int err = user_write(dev, USER_BANK0, rates[i].reg, rates[i].hz);
+        if (!err) {
+            err = user_read(dev, USER_BANK0, rates[i].reg, &got);
+        }
+        if (err) {
+            return err;
+        }
+        if (got != rates[i].hz) {
+            LOG_ERR("%s: wrote %u Hz, pad reads back %u", rates[i].name, rates[i].hz, got);
+            return -EIO;
+        }
+        LOG_INF("%s %u Hz", rates[i].name, rates[i].hz);
+    }
+
+    /* The pad's own estimate of the rate it runs at (the frame rate of the
+     * rest mode while idle). A live MAX_REPORT_RATE write is honoured: on
+     * Daisy firmware 0x1204, written while in rest2, the next touch ran at
+     * the new rate. Whether a write mid-run switches at once is untested, so
+     * this may still show the old rate until the pad next enters run mode. */
+    uint16_t obs;
+    if (read_u16(dev, REPORT_ID_USER, USER_BANK0, REG_USER0_OBS_REPORT_RATE, &obs) == 0) {
+        LOG_INF("pad observed report rate %u Hz", obs);
+    }
+    return 0;
+}
+
+int pixart_tp_apply_rates(const struct device *dev) {
+    if (!ANY_RATE_SET) {
+        return 0;
+    }
+    int err = hid_touchpad_claim(dev, K_MSEC(100));
+    if (err) {
+        return err;
+    }
+    err = apply_rates_locked(dev);
+    hid_touchpad_release(dev);
+    return err;
+}
+
+#if IS_ENABLED(CONFIG_HID_TOUCHPAD_PIXART_RATES)
+/* The pad sits on its own rail and keeps its registers across keyboard
+ * reboots, but a pad that lost power reloads the firmware's rates, and the
+ * keyboard boots with it. APPLICATION level: after the driver's POST_KERNEL
+ * init has seen the pad's HID descriptor. */
+static int apply_rates_at_boot(void) {
+    const struct device *dev = DEVICE_DT_GET(TP_NODE);
+
+    if (!device_is_ready(dev)) {
+        LOG_WRN("touchpad not ready, rates not applied");
+        return 0;
+    }
+    int err = pixart_tp_apply_rates(dev);
+    if (err) {
+        LOG_ERR("applying touchpad rates failed: %d", err);
+    }
+    return 0;
+}
+
+SYS_INIT(apply_rates_at_boot, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+#endif
 
 /* --- flash engine ---------------------------------------------------------- */
 
@@ -618,6 +723,13 @@ static int update_locked(const struct device *dev, const struct pixart_tp_fw_ima
     LOG_INF("pad now boot 0x%02x version 0x%04x", info.boot_status, info.version);
     if (info.boot_status == PIXART_TP_BOOT_STATUS_ROM || info.version != img->version) {
         return -EIO;
+    }
+    /* The reset just reloaded the firmware's own rates from flash. */
+    if (IS_ENABLED(CONFIG_HID_TOUCHPAD_PIXART_RATES) && ANY_RATE_SET) {
+        err = apply_rates_locked(dev);
+        if (err) {
+            LOG_WRN("firmware updated, but applying rates failed: %d", err);
+        }
     }
     return 0;
 }

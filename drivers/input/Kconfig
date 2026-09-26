@@ -144,6 +144,23 @@ config HID_TOUCHPAD_PIXART_UPDATE
       firmware in its own image and converge the pad to it. Policy (when to
       flash, power gating, factory hooks) lives in the board, not here.
 
+DT_PROP_PIXART_MAX_REPORT_RATE := pixart,max-report-rate
+DT_PROP_PIXART_REST1_FRAME_RATE := pixart,rest1-frame-rate
+DT_PROP_PIXART_REST2_FRAME_RATE := pixart,rest2-frame-rate
+
+config HID_TOUCHPAD_PIXART_RATES
+    bool "Apply PixArt report/frame rates from devicetree"
+    default y if $(dt_compat_any_has_prop,$(DT_COMPAT_ZMK_HID_TOUCHPAD),$(DT_PROP_PIXART_MAX_REPORT_RATE)) || \
+                 $(dt_compat_any_has_prop,$(DT_COMPAT_ZMK_HID_TOUCHPAD),$(DT_PROP_PIXART_REST1_FRAME_RATE)) || \
+                 $(dt_compat_any_has_prop,$(DT_COMPAT_ZMK_HID_TOUCHPAD),$(DT_PROP_PIXART_REST2_FRAME_RATE))
+    help
+      Write the touchpad node's pixart,max-report-rate,
+      pixart,rest1-frame-rate and pixart,rest2-frame-rate into the pad's
+      user registers over vendor feature report 0x43: once at boot and
+      again after every pixart_tp_update(), whose final reset reloads the
+      firmware's own values from flash. On by default whenever one of
+      those properties is set.
+
 config HID_TOUCHPAD_INPUT_STATS
     bool "Log 1 Hz input-report rate and I2C read timing"
     help

@@ -76,3 +76,31 @@ properties:
       Feature reports to expose over BLE (default: feature-report-ids). Each
       must also be in feature-report-ids. Set it when ble-report-descriptor
       leaves some out.
+
+  # PixArt pads only, written over vendor feature report 0x43. Each value
+  # overrides the user register the firmware's parameter section loads at
+  # pad boot; leave a property out to keep the firmware's value.
+
+  pixart,max-report-rate:
+    type: int
+    description: >
+      Run-mode report rate to request, in Hz, 1-255 (user bank 0
+      MAX_REPORT_RATE, 0x12). Daisy firmware 0x1204 ships 140, earlier
+      releases 130. The pad may deliver less under noise avoidance
+      (OBS_REPORT_RATE, 0x10/0x11).
+
+  pixart,rest1-frame-rate:
+    type: int
+    description: >
+      Frame rate in Hz, 1-255, of the first idle mode, entered after
+      REST1_DS (0x18/0x19, 50 ms units) without touch (user bank 0
+      REST1_FRAME_RATE, 0x1c). Daisy firmware ships 20. Derived from the
+      slow oscillator, so the real rate may be off by up to 50%.
+
+  pixart,rest2-frame-rate:
+    type: int
+    description: >
+      Frame rate in Hz, 1-255, of the second, deeper idle mode, entered
+      after a further REST2_DS (0x1a/0x1b) (user bank 0 REST2_FRAME_RATE,
+      0x1d). Bounds how long the first touch after a long idle takes to
+      register. Daisy firmware 0x1203+ ships 20, 0x1202 shipped 4.
