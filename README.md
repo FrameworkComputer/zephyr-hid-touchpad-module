@@ -26,6 +26,8 @@ Binding: `zmk,hid-touchpad` (`dts/bindings/input/zmk,hid-touchpad.yml`).
 | `ptp-input-report-id/-size`   | report ID and data size of the PTP multitouch report         |
 | `feature-report-ids`       | every feature report the pad exposes                            |
 | `feature-report-sizes`     | data size of each, parallel to the IDs (bounds the I2C GET read)|
+| `ble-report-descriptor`    | optional: the Report Map BLE serves instead (see below)         |
+| `ble-feature-report-ids`   | optional: the feature reports BLE exposes (default: all)        |
 
 Sizes exclude the report ID byte. The worked example for a PixArt PCT1036
 pad is `app/boards/shields/daisy/daisy-touchpad.dtsi` in the Daisy
@@ -52,6 +54,18 @@ keyboard tree; the blob is ~700 bytes, so it is not repeated here.
         report-descriptor = [ 05 01 09 02 A1 01 85 01 /* ... */ C0 ];
     };
 };
+```
+
+A GATT attribute value is at most 512 bytes, and a host may stop reading
+the Report Map there. For a longer descriptor, `scripts/ble_report_map.py`
+writes a BLE copy next to it: it leaves out the top-level collections on
+the usage pages you name, drops global items that repeat a value already in
+effect, and checks that every remaining report parses exactly as in
+`report-descriptor`. USB keeps the full descriptor.
+
+```sh
+python3 scripts/ble_report_map.py path/to/touchpad.dtsi --drop-page 0xff00          # write
+python3 scripts/ble_report_map.py path/to/touchpad.dtsi --drop-page 0xff00 --check  # verify
 ```
 
 The USB backend additionally needs a `zephyr,hid-device` node labelled

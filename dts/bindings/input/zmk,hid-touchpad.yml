@@ -28,6 +28,15 @@ properties:
     required: true
     description: Full HID report descriptor blob
 
+  ble-report-descriptor:
+    type: uint8-array
+    description: >
+      Report map to serve over BLE instead of report-descriptor. A GATT
+      attribute value is limited to 512 bytes, and a host may stop reading
+      the Report Map there, so a longer descriptor needs a BLE copy: the
+      same reports, described identically, with collections BLE doesn't
+      need left out. scripts/ble_report_map.py writes and checks it.
+
   mouse-input-report-id:
     type: int
     required: true
@@ -60,3 +69,10 @@ properties:
       Data size in bytes (excluding the report ID) of each feature report,
       parallel to feature-report-ids. Bounds the I2C read a GET_REPORT
       clocks, so a 1-byte report doesn't cost a full-buffer transfer.
+
+  ble-feature-report-ids:
+    type: array
+    description: >
+      Feature reports to expose over BLE (default: feature-report-ids). Each
+      must also be in feature-report-ids. Set it when ble-report-descriptor
+      leaves some out.

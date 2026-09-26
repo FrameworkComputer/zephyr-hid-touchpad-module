@@ -7,6 +7,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/init.h>
+#include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/util.h>
@@ -27,6 +28,27 @@ LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_HID_PASSTHROUGH_BLE_LOG_LEVEL);
 #define TP_PTP_INPUT_REPORT_ID    DT_PROP(TP_NODE, ptp_input_report_id)
 #define TP_MOUSE_INPUT_REPORT_SIZE DT_PROP(TP_NODE, mouse_input_report_size)
 #define TP_PTP_INPUT_REPORT_SIZE  DT_PROP(TP_NODE, ptp_input_report_size)
+
+/* The Report Map and the feature reports BLE serves: ble-report-descriptor
+ * and ble-feature-report-ids when the board sets them, else the same as
+ * USB. A GATT attribute value is at most 512 bytes, and a host may stop
+ * reading the Report Map there, so a longer descriptor needs a BLE copy. */
+#if DT_NODE_HAS_PROP(TP_NODE, ble_report_descriptor)
+static const uint8_t tp_ble_report_map[] = DT_PROP(TP_NODE, ble_report_descriptor);
+BUILD_ASSERT(sizeof(tp_ble_report_map) <= BT_ATT_MAX_ATTRIBUTE_LEN,
+             "ble-report-descriptor is longer than a GATT attribute may be");
+#define TP_BLE_REPORT_MAP      tp_ble_report_map
+#define TP_BLE_REPORT_MAP_SIZE sizeof(tp_ble_report_map)
+#else
+#define TP_BLE_REPORT_MAP      tp_report_desc
+#define TP_BLE_REPORT_MAP_SIZE tp_report_desc_size
+#endif
+
+#if DT_NODE_HAS_PROP(TP_NODE, ble_feature_report_ids)
+#define TP_BLE_FEATURE_IDS ble_feature_report_ids
+#else
+#define TP_BLE_FEATURE_IDS feature_report_ids
+#endif
 
 enum {
     HIDS_REMOTE_WAKE = BIT(0),
@@ -68,7 +90,7 @@ static struct hids_report ptp_input_ref = { .id = TP_PTP_INPUT_REPORT_ID, .type 
 #define FEATURE_REF_DECL(node, prop, idx) \
     static struct hids_report feature_ref_##idx = { \
         .id = DT_PROP_BY_IDX(node, prop, idx), .type = HIDS_FEATURE };
-DT_FOREACH_PROP_ELEM(TP_NODE, feature_report_ids, FEATURE_REF_DECL)
+DT_FOREACH_PROP_ELEM(TP_NODE, TP_BLE_FEATURE_IDS, FEATURE_REF_DECL)
 
 static uint8_t ctrl_point;
 static const struct device *tp_dev;
@@ -93,8 +115,8 @@ static ssize_t read_hids_report_ref(struct bt_conn *conn, const struct bt_gatt_a
 
 static ssize_t read_hids_report_map(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                      void *buf, uint16_t len, uint16_t offset) {
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, tp_report_desc,
-                             tp_report_desc_size);
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, TP_BLE_REPORT_MAP,
+                             TP_BLE_REPORT_MAP_SIZE);
 }
 
 static ssize_t read_mouse_input_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -246,7 +268,7 @@ BT_GATT_SERVICE_DEFINE(
                        read_hids_report_ref, NULL, &ptp_input_ref),
 
     /* Feature reports (generated from devicetree) */
-    DT_FOREACH_PROP_ELEM(TP_NODE, feature_report_ids, FEATURE_GATT_ATTRS)
+    DT_FOREACH_PROP_ELEM(TP_NODE, TP_BLE_FEATURE_IDS, FEATURE_GATT_ATTRS)
 
     /* HID Control Point */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
@@ -599,6 +621,18 @@ static int hid_passthrough_ble_init(void) {
         return 0;
     }
     tp_dev = dev;
+
+    if (TP_BLE_REPORT_MAP_SIZE > BT_ATT_MAX_ATTRIBUTE_LEN) {
+        LOG_WRN("Report map is %u bytes, over the %u a GATT attribute may be; hosts may "
+                "truncate it (set ble-report-descriptor)",
+                (unsigned int)TP_BLE_REPORT_MAP_SIZE, BT_ATT_MAX_ATTRIBUTE_LEN);
+    }
+    static const uint8_t ble_feature_ids[] = DT_PROP(TP_NODE, TP_BLE_FEATURE_IDS);
+    for (size_t i = 0; i < ARRAY_SIZE(ble_feature_ids); i++) {
+        if (hid_touchpad_feature_size(ble_feature_ids[i]) < 0) {
+            LOG_ERR("BLE feature report %u is not in feature-report-ids", ble_feature_ids[i]);
+        }
+    }
 
     if (!tp_input_attr_ok(TP_MOUSE_INPUT_ATTR_IDX, read_mouse_input_report) ||
         !tp_input_attr_ok(TP_PTP_INPUT_ATTR_IDX, read_ptp_input_report)) {
