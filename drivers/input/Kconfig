@@ -57,6 +57,45 @@ config HID_PASSTHROUGH_USB_NEXT
     def_bool y
     depends on HID_PASSTHROUGH_USB && USBD_HID_SUPPORT
 
+config HID_PASSTHROUGH_USB_APPLE_MT
+    bool "Present the touchpad to macOS as an Apple multitouch trackpad (prototype)"
+    depends on HID_PASSTHROUGH_USB_NEXT
+    help
+      Replace the pad's own PTP descriptor on USB with an Apple top-case
+      trackpad's, answer the feature reports macOS's multitouch driver asks
+      for, and translate PTP frames into Magic Trackpad 2 frames. macOS has
+      no PTP driver, so this is the only way to get its gestures.
+
+      The driver binds by VID/PID, so the board must also set
+      CONFIG_USB_DEVICE_VID=0x05AC and CONFIG_USB_DEVICE_PID=0x0272 (the
+      2015 MacBook's internal USB top case). Apple's vendor ID: private
+      test builds only. The pad is put into PTP mode when USB comes up,
+      since no host driver will do it.
+
+if HID_PASSTHROUGH_USB_APPLE_MT
+
+config HID_PASSTHROUGH_USB_APPLE_MT_WIDTH
+    int "Touch surface width in 0.01 mm"
+    default 6640
+
+config HID_PASSTHROUGH_USB_APPLE_MT_HEIGHT
+    int "Touch surface height in 0.01 mm"
+    default 8320
+
+config HID_PASSTHROUGH_USB_APPLE_MT_X_MAX
+    int "PTP logical X maximum"
+    default 796
+
+config HID_PASSTHROUGH_USB_APPLE_MT_Y_MAX
+    int "PTP logical Y maximum"
+    default 998
+
+config HID_PASSTHROUGH_USB_APPLE_MT_INPUT_MODE_REPORT_ID
+    int "Feature report ID of the pad's PTP Input Mode"
+    default 3
+
+endif
+
 config HID_PASSTHROUGH_BLE
     bool "BLE HID Passthrough for touchpad"
     depends on ZMK_BLE
