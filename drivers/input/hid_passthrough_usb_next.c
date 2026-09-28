@@ -17,8 +17,10 @@
 #include <zmk/usb.h>
 
 #include "hid_touchpad.h"
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
+#if defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_MT)
 #include "apple_mt.h"
+#elif defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_IPAD)
+#include "ipad_tp.h"
 #endif
 
 #include <zephyr/logging/log.h>
@@ -34,31 +36,57 @@ static const struct device *const hid_dev = DEVICE_DT_GET(TP_HID_NODE);
 static const struct device *tp_dev;
 static bool hid_ready;
 
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
+#if defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_MT)
 static struct apple_mt apple_mt;
 /* Frames are stamped from the first one, as VoodooInput does. */
 static int64_t apple_mt_epoch;
+#elif defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_IPAD)
+static struct ipad_tp ipad_tp;
+#endif
 
-/* No macOS driver sets the PTP Input Mode, and the pad powers up as a mouse,
+#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE
+/* No Apple host sets the PTP Input Mode, and the pad powers up as a mouse,
  * so switch it on every enumeration. I2C, so not from the USB callback. */
 static void ptp_mode_work_fn(struct k_work *work) {
     const uint8_t ptp_mode = 3;
     int err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE,
-                                      CONFIG_HID_PASSTHROUGH_USB_APPLE_MT_INPUT_MODE_REPORT_ID,
+                                      CONFIG_HID_PASSTHROUGH_USB_APPLE_INPUT_MODE_REPORT_ID,
                                       &ptp_mode, 1);
     if (err) {
-        LOG_ERR("apple-mt: setting PTP input mode failed: %d", err);
+        LOG_ERR("apple: setting PTP input mode failed: %d", err);
     } else {
-        LOG_INF("apple-mt: pad in PTP mode");
+        LOG_INF("apple: pad in PTP mode");
     }
 }
 static K_WORK_DEFINE(ptp_mode_work, ptp_mode_work_fn);
+
+/* The host talks to the trackpad we present, never to the pad. */
+static int apple_get_report(uint8_t type, uint8_t id, uint16_t len, uint8_t *buf) {
+#if defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_MT)
+    int n = apple_mt_get_report(&apple_mt, id, buf, len);
+#else
+    int n = ipad_tp_get_report(&ipad_tp, id, buf, len);
+#endif
+    LOG_INF("apple: GET type=%u id=0x%02x len=%u -> %d", type, id, len, n);
+    return n < 0 ? -ENOTSUP : n;
+}
+
+static int apple_set_report(uint8_t type, uint8_t id, uint16_t len, const uint8_t *buf) {
+    LOG_INF("apple: SET type=%u id=0x%02x len=%u data=0x%02x", type, id, len,
+            len > 1 ? buf[1] : 0);
+#if defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_MT)
+    apple_mt_set_report(&apple_mt, id, buf, len);
+#else
+    ipad_tp_set_report(&ipad_tp, id, buf, len);
+#endif
+    return 0;
+}
 #endif
 
 static void iface_ready_cb(const struct device *dev, const bool ready) {
     LOG_INF("TP HID interface %s", ready ? "ready" : "not ready");
     hid_ready = ready;
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
+#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE
     if (ready && tp_dev != NULL && device_is_ready(tp_dev)) {
         k_work_submit(&ptp_mode_work);
     }
@@ -71,11 +99,8 @@ static int get_report_cb(const struct device *dev, const uint8_t type, const uin
 
     LOG_DBG("get_report: type=%u id=0x%02x len=%u", type, id, len);
 
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
-    /* The host talks to the Apple trackpad we present, never to the pad. */
-    int n = apple_mt_get_report(&apple_mt, id, buf, len);
-    LOG_INF("apple-mt: GET type=%u id=0x%02x len=%u -> %d", type, id, len, n);
-    return n < 0 ? -ENOTSUP : n;
+#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE
+    return apple_get_report(type, id, len, buf);
 #endif
 
     if (tp_dev == NULL || !device_is_ready(tp_dev)) {
@@ -116,11 +141,8 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
 
     LOG_DBG("set_report: type=%u id=0x%02x len=%u", type, id, len);
 
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
-    LOG_INF("apple-mt: SET type=%u id=0x%02x len=%u cmd=0x%02x", type, id, len,
-            len > 1 ? buf[1] : 0);
-    apple_mt_set_report(&apple_mt, id, buf, len);
-    return 0;
+#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE
+    return apple_set_report(type, id, len, buf);
 #endif
 
     if (tp_dev == NULL || !device_is_ready(tp_dev)) {
@@ -197,14 +219,11 @@ static void submit_report(const uint8_t *report, size_t len) {
     }
 }
 
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
-static void apple_mt_input(uint8_t report_id, const uint8_t *data, uint16_t len) {
+#if defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_MT)
+static void apple_input(const uint8_t *data, uint16_t len) {
     uint8_t frame[APPLE_MT_MAX_FRAME];
     bool lifted;
 
-    if (report_id != TP_PTP_INPUT_REPORT_ID) {
-        return; /* the pad's mouse report: macOS gets pointer motion from us */
-    }
     if (apple_mt_epoch == 0) {
         apple_mt_epoch = k_uptime_get();
     }
@@ -219,6 +238,15 @@ static void apple_mt_input(uint8_t report_id, const uint8_t *data, uint16_t len)
             now += step == 1 ? 0 : 10;
             submit_report(frame, apple_mt_lift_frame(&apple_mt, step, now, frame));
         }
+    }
+}
+#elif defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_IPAD)
+static void apple_input(const uint8_t *data, uint16_t len) {
+    uint8_t report[IPAD_TP_REPORT_BYTES];
+    size_t n = ipad_tp_frame(&ipad_tp, data, len, report);
+
+    if (n > 0) {
+        submit_report(report, n);
     }
 }
 #endif
@@ -244,8 +272,12 @@ static void tp_input_cb(const struct device *dev, uint8_t report_id,
         return;
     }
 
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
-    apple_mt_input(report_id, data, len);
+#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE
+    /* Only PTP frames: the pad's mouse report has no place in either
+     * presentation, and the pad is in PTP mode anyway. */
+    if (report_id == TP_PTP_INPUT_REPORT_ID) {
+        apple_input(data, len);
+    }
 #else
     /* hid_device_submit_report() expects the report ID as the first byte. */
     uint8_t report[64];
@@ -270,12 +302,18 @@ static int hid_passthrough_usb_init(void) {
      * initialize its interface, even if the physical touchpad isn't
      * present or failed to init. Without this, usbd_register_all_classes()
      * refuses to bring up ANY interface (including the keyboard HID). */
-#ifdef CONFIG_HID_PASSTHROUGH_USB_APPLE_MT
-    apple_mt_init(&apple_mt, CONFIG_HID_PASSTHROUGH_USB_APPLE_MT_X_MAX,
-                  CONFIG_HID_PASSTHROUGH_USB_APPLE_MT_Y_MAX,
-                  CONFIG_HID_PASSTHROUGH_USB_APPLE_MT_WIDTH,
-                  CONFIG_HID_PASSTHROUGH_USB_APPLE_MT_HEIGHT);
+#if defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_MT)
+    apple_mt_init(&apple_mt, CONFIG_HID_PASSTHROUGH_USB_APPLE_X_MAX,
+                  CONFIG_HID_PASSTHROUGH_USB_APPLE_Y_MAX, CONFIG_HID_PASSTHROUGH_USB_APPLE_WIDTH,
+                  CONFIG_HID_PASSTHROUGH_USB_APPLE_HEIGHT);
     int err = hid_device_register(hid_dev, apple_mt_report_desc, apple_mt_report_desc_size, &ops);
+#elif defined(CONFIG_HID_PASSTHROUGH_USB_APPLE_IPAD)
+    /* ipad_tp takes the surface in 0.1 mm. */
+    ipad_tp_init(&ipad_tp, CONFIG_HID_PASSTHROUGH_USB_APPLE_X_MAX,
+                 CONFIG_HID_PASSTHROUGH_USB_APPLE_Y_MAX, CONFIG_HID_PASSTHROUGH_USB_APPLE_WIDTH / 10,
+                 CONFIG_HID_PASSTHROUGH_USB_APPLE_HEIGHT / 10,
+                 CONFIG_HID_PASSTHROUGH_USB_APPLE_REPORT_RATE);
+    int err = hid_device_register(hid_dev, ipad_tp.desc, ipad_tp.desc_len, &ops);
 #else
     int err = hid_device_register(hid_dev, tp_report_desc, tp_report_desc_size, &ops);
 #endif
