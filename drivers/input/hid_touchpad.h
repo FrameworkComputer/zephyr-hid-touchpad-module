@@ -28,6 +28,10 @@ extern "C" {
 #define I2C_HID_PWR_ON    0x00
 #define I2C_HID_PWR_SLEEP 0x01
 
+/* PTP Input Mode feature values (Windows Precision Touchpad, usage 0x52) */
+#define PTP_INPUT_MODE_MOUSE    0x00
+#define PTP_INPUT_MODE_TOUCHPAD 0x03
+
 /* Report descriptor, provided by devicetree (`report-descriptor`) */
 extern const uint8_t tp_report_desc[];
 extern const size_t tp_report_desc_size;
@@ -36,6 +40,11 @@ struct hid_touchpad_config {
     struct i2c_dt_spec i2c_bus;
     const struct gpio_dt_spec dr;
     uint8_t hid_desc_register;
+    uint8_t mouse_report_id;
+    uint8_t ptp_report_id;
+    uint8_t ptp_report_size;
+    /* 0 = not set in devicetree: hid_touchpad_set_mode() is unsupported */
+    uint8_t input_mode_report_id;
 };
 
 typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report_id,
@@ -59,6 +68,20 @@ struct hid_touchpad_data {
     struct k_mutex lock;
     /* Thread holding an exclusive claim (hid_touchpad_claim), or NULL. */
     k_tid_t claim_owner;
+    /* hid_touchpad_set_mode() state, under lock: whether the pad is held in
+     * mouse mode, and the Input Mode the host last wrote (the pad powers up
+     * in mouse mode, so 0 until a host asks for PTP). */
+    bool force_mouse;
+    uint8_t host_input_mode;
+    /* Mouse-mode X/Y scale as (mul << 16 | div), set from any thread; the
+     * rest is only touched on the driver's work queue. */
+    atomic_t mouse_scale;
+    uint32_t mouse_scale_seen;
+    int32_t mouse_rem[2];
+    /* Last frames handed downstream, to lift what they hold on a mode switch */
+    uint8_t last_ptp[32];
+    uint8_t last_mouse_buttons;
+    struct k_work lift_work;
 };
 
 /**
@@ -164,6 +187,46 @@ int hid_touchpad_release(const struct device *dev);
  * other call.
  */
 int hid_touchpad_reinit_descriptor(const struct device *dev);
+
+enum hid_touchpad_mode {
+    /* The host decides: PTP once it writes Input Mode = touchpad (Windows,
+     * Linux), otherwise the pad's own mouse mode (macOS, TVs). */
+    HID_TOUCHPAD_MODE_HOST,
+    /* The pad is held in mouse mode whatever the host asks for. */
+    HID_TOUCHPAD_MODE_MOUSE,
+};
+
+/**
+ * Switch between the host's choice of input mode and forced mouse mode.
+ *
+ * Forcing mouse mode writes Input Mode = mouse to the pad. The host's own
+ * Input Mode writes are then remembered but not forwarded (and a host that
+ * reads the report back gets its own value), so it can't flip the pad back
+ * behind the keyboard's back; switching to HID_TOUCHPAD_MODE_HOST restores
+ * the value it last wrote. Whatever the switch cut off mid-gesture -- fingers
+ * down in the last PTP frame, a button held in the last mouse report -- is
+ * released with one synthetic frame, so nothing stays stuck on the host.
+ *
+ * Blocking I2C: call from a thread (a behavior's handler is fine), not an ISR.
+ *
+ * @return 0, -ENOTSUP when the node has no input-mode-report-id, -EINVAL for
+ *         an unknown mode, -EBUSY while the pad is claimed, or the I2C error.
+ */
+int hid_touchpad_set_mode(const struct device *dev, enum hid_touchpad_mode mode);
+
+enum hid_touchpad_mode hid_touchpad_get_mode(const struct device *dev);
+
+/**
+ * Scale the X/Y motion of the pad's mouse-mode reports by mul/div (the
+ * devicetree's mouse-scale-multiplier/-divisor at boot). Fractions are
+ * carried between reports, so 3/2 moves exactly 1.5x; a result past the
+ * report's +-127 range is clipped. Buttons and wheel are left alone, and so
+ * are frames fed in through hid_touchpad_inject_input(). Callable from any
+ * thread; takes effect with the next report.
+ *
+ * @return 0, or -EINVAL when div is 0.
+ */
+int hid_touchpad_set_mouse_scale(const struct device *dev, uint16_t mul, uint16_t div);
 
 #ifdef __cplusplus
 }

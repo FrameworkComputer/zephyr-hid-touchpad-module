@@ -39,6 +39,18 @@ static const uint16_t tp_feature_sizes[] = DT_INST_PROP(0, feature_report_sizes)
 BUILD_ASSERT(ARRAY_SIZE(tp_feature_ids) == ARRAY_SIZE(tp_feature_sizes),
              "feature-report-sizes must be parallel to feature-report-ids");
 
+BUILD_ASSERT(DT_INST_PROP(0, mouse_scale_divisor) > 0 &&
+                 DT_INST_PROP(0, mouse_scale_divisor) <= UINT16_MAX &&
+                 DT_INST_PROP(0, mouse_scale_multiplier) <= UINT16_MAX,
+             "mouse-scale-multiplier/-divisor must be 16-bit, divisor at least 1");
+BUILD_ASSERT(DT_INST_PROP(0, ptp_input_report_size) <=
+                 sizeof(((struct hid_touchpad_data *)0)->last_ptp),
+             "ptp-input-report-size is larger than the lift frame buffer");
+BUILD_ASSERT((DT_INST_PROP(0, ptp_input_report_size) - 4) % 5 == 0,
+             "ptp-input-report-size doesn't fit 5 equal contact records + 4 trailer bytes");
+BUILD_ASSERT(DT_INST_PROP(0, mouse_input_report_size) >= 3,
+             "mouse-input-report-size must cover buttons, X and Y");
+
 int hid_touchpad_feature_size(uint8_t id) {
     for (size_t i = 0; i < ARRAY_SIZE(tp_feature_ids); i++) {
         if (tp_feature_ids[i] == id) {
@@ -159,11 +171,18 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
     uint16_t copy_len = MIN(data_len, buf_len);
     memcpy(buf, &i2c_buf[3], copy_len);
     *out_len = copy_len;
+
+    /* While mouse mode is forced the pad says 0; the host reads back what it
+     * wrote, so it has no reason to write it again. */
+    if (type == I2C_HID_REPORT_TYPE_FEATURE && id == config->input_mode_report_id &&
+        copy_len >= 1 && data->force_mouse) {
+        buf[0] = data->host_input_mode;
+    }
     return 0;
 }
 
-int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
-                            const uint8_t *report_data, uint16_t len) {
+static int tp_set_report(const struct device *dev, uint8_t type, uint8_t id,
+                         const uint8_t *report_data, uint16_t len) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
@@ -231,6 +250,37 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
     }
 }
 
+int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
+                            const uint8_t *report_data, uint16_t len) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
+    if (type != I2C_HID_REPORT_TYPE_FEATURE || id != config->input_mode_report_id ||
+        len < 1) {
+        return tp_set_report(dev, type, id, report_data, len);
+    }
+
+    /* The host's Input Mode. Remember it for HID_TOUCHPAD_MODE_HOST, and
+     * while mouse mode is forced keep it off the pad: Linux writes it again
+     * on every resume and reset. The lock is recursive, so tp_set_report()
+     * takes it again inside; holding it here keeps the check and the write
+     * atomic against hid_touchpad_set_mode(). */
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    if (data->force_mouse) {
+        LOG_INF("host input mode %u held back, mouse mode forced", report_data[0]);
+    } else {
+        err = tp_set_report(dev, type, id, report_data, len);
+    }
+    if (err == 0) {
+        data->host_input_mode = report_data[0];
+    }
+    tp_unlock(data);
+    return err;
+}
+
 int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
@@ -288,7 +338,15 @@ void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input
  * indistinguishable from a real one downstream. */
 static void tp_dispatch_input(const struct device *dev, uint8_t report_id, const uint8_t *data,
                               uint16_t len) {
-    const struct hid_touchpad_data *tp = dev->data;
+    struct hid_touchpad_data *tp = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
+    if (report_id == config->ptp_report_id) {
+        memset(tp->last_ptp, 0, sizeof(tp->last_ptp));
+        memcpy(tp->last_ptp, data, MIN(len, config->ptp_report_size));
+    } else if (report_id == config->mouse_report_id && len >= 1) {
+        tp->last_mouse_buttons = data[0];
+    }
 
     for (int i = 0; i < tp->num_cbs; i++) {
         if (tp->input_cbs[i]) {
@@ -301,6 +359,124 @@ void hid_touchpad_inject_input(const struct device *dev, uint8_t report_id, cons
                                uint16_t len) {
     LOG_DBG("inject report id=%u len=%u", report_id, len);
     tp_dispatch_input(dev, report_id, data, len);
+}
+
+#define TP_MOUSE_SCALE(mul, div) (((uint32_t)(mul) << 16) | (div))
+
+int hid_touchpad_set_mouse_scale(const struct device *dev, uint16_t mul, uint16_t div) {
+    struct hid_touchpad_data *data = dev->data;
+
+    if (div == 0) {
+        return -EINVAL;
+    }
+    atomic_set(&data->mouse_scale, TP_MOUSE_SCALE(mul, div));
+    LOG_INF("mouse scale %u/%u", mul, div);
+    return 0;
+}
+
+/* Scale X and Y (bytes 1 and 2, int8, the boot-mouse layout every PTP
+ * pad's mouse collection uses) in place. The remainder carries what integer
+ * division drops, so slow motion isn't rounded away at fractional scales. */
+static void tp_scale_mouse(struct hid_touchpad_data *data, uint8_t *report, uint16_t len) {
+    uint32_t scale = atomic_get(&data->mouse_scale);
+
+    if (scale != data->mouse_scale_seen) {
+        data->mouse_scale_seen = scale;
+        data->mouse_rem[0] = data->mouse_rem[1] = 0;
+    }
+    if (scale == TP_MOUSE_SCALE(1, 1) || len < 3) {
+        return;
+    }
+    int32_t mul = scale >> 16;
+    int32_t div = scale & 0xFFFF;
+
+    for (int axis = 0; axis < 2; axis++) {
+        int32_t v = (int8_t)report[1 + axis] * mul + data->mouse_rem[axis];
+        int32_t out = v / div;
+        data->mouse_rem[axis] = v - out * div;
+        report[1 + axis] = (uint8_t)(int8_t)CLAMP(out, -127, 127);
+    }
+}
+
+/* PTP payload layout, as the BLE backend reads it: 5 contact records of
+ * (status byte + x u16 + y u16), then contact count, buttons, scan time. */
+#define TP_PTP_MAX_CONTACTS 5
+#define TP_PTP_TRAILER_LEN  4
+#define TP_PTP_TIP          BIT(1) /* status byte: bit 0 confidence, bit 1 tip */
+
+/* Release whatever the input mode we just left was holding on the host. Runs
+ * on the driver's work queue, the same one that dispatches pad reports, so
+ * it can't interleave with a frame and last_ptp needs no lock. */
+static void tp_lift_work_cb(struct k_work *work) {
+    struct hid_touchpad_data *data = CONTAINER_OF(work, struct hid_touchpad_data, lift_work);
+    const struct hid_touchpad_config *config = data->dev->config;
+    uint16_t size = config->ptp_report_size;
+
+    if (data->force_mouse) {
+        /* Now in mouse mode: send the last PTP frame again with every tip
+         * and the button up, the lift report the PTP spec expects. */
+        uint16_t fingers_len = size - TP_PTP_TRAILER_LEN;
+        uint16_t stride = fingers_len / TP_PTP_MAX_CONTACTS;
+        uint8_t frame[sizeof(data->last_ptp)];
+        bool held = false;
+
+        memcpy(frame, data->last_ptp, size);
+        for (int i = 0; i < TP_PTP_MAX_CONTACTS; i++) {
+            held |= frame[i * stride] & TP_PTP_TIP;
+            frame[i * stride] &= ~TP_PTP_TIP;
+        }
+        held |= frame[fingers_len + 1] != 0;
+        frame[fingers_len + 1] = 0;
+        if (!held) {
+            return;
+        }
+        /* 100 us units; a repeated scan time could read as a duplicate */
+        sys_put_le16(sys_get_le16(&frame[fingers_len + 2]) + 10, &frame[fingers_len + 2]);
+        tp_dispatch_input(data->dev, config->ptp_report_id, frame, size);
+    } else if (data->last_mouse_buttons != 0) {
+        /* Back to the host's mode, which may be PTP: no further mouse report
+         * would ever release a held button. */
+        uint8_t report[DT_INST_PROP(0, mouse_input_report_size)] = {0};
+        tp_dispatch_input(data->dev, config->mouse_report_id, report, sizeof(report));
+    }
+}
+
+int hid_touchpad_set_mode(const struct device *dev, enum hid_touchpad_mode mode) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+
+    if (config->input_mode_report_id == 0) {
+        return -ENOTSUP;
+    }
+    if (mode != HID_TOUCHPAD_MODE_HOST && mode != HID_TOUCHPAD_MODE_MOUSE) {
+        return -EINVAL;
+    }
+    bool force = mode == HID_TOUCHPAD_MODE_MOUSE;
+
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    uint8_t value = force ? PTP_INPUT_MODE_MOUSE : data->host_input_mode;
+    err = tp_set_report(dev, I2C_HID_REPORT_TYPE_FEATURE, config->input_mode_report_id,
+                        &value, 1);
+    if (err == 0) {
+        data->force_mouse = force;
+    }
+    tp_unlock(data);
+    if (err) {
+        return err;
+    }
+
+    LOG_INF("input mode: %s (pad input mode %u)", force ? "mouse (forced)" : "host", value);
+    k_work_submit_to_queue(&tp_workq, &data->lift_work);
+    return 0;
+}
+
+enum hid_touchpad_mode hid_touchpad_get_mode(const struct device *dev) {
+    const struct hid_touchpad_data *data = dev->data;
+
+    return data->force_mouse ? HID_TOUCHPAD_MODE_MOUSE : HID_TOUCHPAD_MODE_HOST;
 }
 
 #ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
@@ -379,6 +555,15 @@ static int hid_touchpad_report_data(const struct device *dev) {
         }
     }
 #endif
+
+    if (report_id == config->ptp_report_id && data->force_mouse) {
+        /* Read off the pad before the switch reached it; after the lift frame
+         * it would put the fingers straight back down on the host. */
+        return 0;
+    }
+    if (report_id == config->mouse_report_id) {
+        tp_scale_mouse(data, &data->report_buf[3], data_len);
+    }
 
     tp_dispatch_input(dev, report_id, &data->report_buf[3], data_len);
     return 0;
@@ -586,6 +771,10 @@ static int hid_touchpad_init(const struct device *dev) {
     }
 
     data->dev = dev;
+    atomic_set(&data->mouse_scale, TP_MOUSE_SCALE(DT_INST_PROP(0, mouse_scale_multiplier),
+                                                  DT_INST_PROP(0, mouse_scale_divisor)));
+    data->mouse_scale_seen = atomic_get(&data->mouse_scale);
+    k_work_init(&data->lift_work, tp_lift_work_cb);
 
     static bool workq_started;
     if (!workq_started) {
@@ -638,6 +827,10 @@ static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_actio
         .i2c_bus = I2C_DT_SPEC_INST_GET(n),                                                      \
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                 \
         .hid_desc_register = DT_INST_PROP(n, hid_descriptor_register),                            \
+        .mouse_report_id = DT_INST_PROP(n, mouse_input_report_id),                                \
+        .ptp_report_id = DT_INST_PROP(n, ptp_input_report_id),                                    \
+        .ptp_report_size = DT_INST_PROP(n, ptp_input_report_size),                                \
+        .input_mode_report_id = DT_INST_PROP_OR(n, input_mode_report_id, 0),                      \
     };                                                                                            \
     PM_DEVICE_DT_INST_DEFINE(n, hid_touchpad_pm_action);                                          \
     DEVICE_DT_INST_DEFINE(n, hid_touchpad_init, PM_DEVICE_DT_INST_GET(n),                         \

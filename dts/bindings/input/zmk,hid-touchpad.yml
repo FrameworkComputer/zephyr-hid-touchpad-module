@@ -57,6 +57,27 @@ properties:
     required: true
     description: Size in bytes of PTP input report data (excluding report ID)
 
+  input-mode-report-id:
+    type: int
+    description: >
+      Feature report ID of the PTP Input Mode (usage 0x52; 0 = mouse,
+      3 = touchpad). Enables hid_touchpad_set_mode(), which can hold the pad
+      in mouse mode whatever the host asks for.
+
+  mouse-scale-multiplier:
+    type: int
+    default: 1
+    description: >
+      Multiplier for the X/Y motion of mouse-mode reports (bytes 1 and 2 of
+      the report, the boot-mouse layout). Motion is scaled by
+      mouse-scale-multiplier / mouse-scale-divisor, fractions carried
+      between reports. hid_touchpad_set_mouse_scale() changes it at runtime.
+
+  mouse-scale-divisor:
+    type: int
+    default: 1
+    description: Divisor for mouse-scale-multiplier, at least 1.
+
   feature-report-ids:
     type: array
     required: true
