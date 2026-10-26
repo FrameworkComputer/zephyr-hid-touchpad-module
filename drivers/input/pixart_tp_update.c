@@ -721,7 +721,12 @@ static int update_locked(const struct device *dev, const struct pixart_tp_fw_ima
         return err;
     }
     LOG_INF("pad now boot 0x%02x version 0x%04x", info.boot_status, info.version);
-    if (info.boot_status == PIXART_TP_BOOT_STATUS_ROM || info.version != img->version) {
+    if (info.boot_status == PIXART_TP_BOOT_STATUS_ROM) {
+        return -EIO;
+    }
+    if (info.version != img->version) {
+        /* Failed, but running a firmware, back in its power-on input mode. */
+        (void)hid_touchpad_restore_retained(dev);
         return -EIO;
     }
     /* The reset just reloaded the firmware's own rates from flash. */
@@ -730,6 +735,12 @@ static int update_locked(const struct device *dev, const struct pixart_tp_fw_ima
         if (err) {
             LOG_WRN("firmware updated, but applying rates failed: %d", err);
         }
+    }
+    /* It also put the pad back in its power-on input mode; reapply the
+     * selected host's. */
+    err = hid_touchpad_restore_retained(dev);
+    if (err) {
+        LOG_WRN("firmware updated, but restoring retained features failed: %d", err);
     }
     return 0;
 }

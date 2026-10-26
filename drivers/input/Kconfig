@@ -134,6 +134,26 @@ config HID_PASSTHROUGH_BLE_FEATURE_PAD_BYTE
       Linux uhid/hidraw copy at most the caller's requested length, so
       the extra byte is discarded. Feature SETs are not changed.
 
+DT_PROP_HOST_STATE_REPORT_IDS := host-state-report-ids
+
+config HID_PASSTHROUGH_HOST_STATE
+    bool "Keep the pad's host-owned feature reports per host"
+    depends on HID_PASSTHROUGH_USB || HID_PASSTHROUGH_BLE
+    default y if $(dt_compat_any_has_prop,$(DT_COMPAT_ZMK_HID_TOUCHPAD),$(DT_PROP_HOST_STATE_REPORT_IDS))
+    help
+      Give USB and every BLE profile their own copy of the feature reports
+      in the touchpad node's host-state-report-ids (PTP Input Mode,
+      Surface/Button Switch, Latency Mode), and write only the selected
+      host's copy to the pad, again on every endpoint or profile switch.
+      Without it every host's writes go straight to the pad, so the last
+      writer's mode applies to whichever host is selected: a Mac selected
+      after a Linux or Windows host gets PTP frames it has no driver for.
+
+      The BLE copies of host-state-saved-report-ids are saved to settings
+      per profile, once per change, since a host that stays bonded doesn't
+      necessarily re-send them after a keyboard reset. On by default when
+      host-state-report-ids is set.
+
 config HID_TOUCHPAD_PIXART_UPDATE
     bool "PixArt PJP360 firmware update protocol"
     help
@@ -181,6 +201,10 @@ source "subsys/logging/Kconfig.template.log_config"
 
 module = HID_PASSTHROUGH_BLE
 module-str = hid_passthrough_ble
+source "subsys/logging/Kconfig.template.log_config"
+
+module = HID_PASSTHROUGH_HOSTS
+module-str = hid_passthrough_hosts
 source "subsys/logging/Kconfig.template.log_config"
 
 endif #HID_TOUCHPAD

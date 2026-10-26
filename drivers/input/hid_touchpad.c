@@ -231,6 +231,36 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
     }
 }
 
+/* Write the retained values the pad doesn't hold yet. Caller holds
+ * retained_lock. */
+static int tp_write_retained_locked(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+
+    if (!data->powered || data->retained_held) {
+        return 0;
+    }
+    int ret = 0;
+    for (size_t i = 0; i < data->num_retained; i++) {
+        struct hid_touchpad_retained *r = &data->retained[i];
+        if (r->on_pad) {
+            continue;
+        }
+        int err = hid_touchpad_set_report(dev, I2C_HID_REPORT_TYPE_FEATURE, r->id, &r->value, 1);
+        if (err == 0) {
+            r->on_pad = true;
+        } else if (ret == 0) {
+            ret = err;
+        }
+    }
+    return ret;
+}
+
+static void tp_retained_lost_locked(struct hid_touchpad_data *data) {
+    for (size_t i = 0; i < data->num_retained; i++) {
+        data->retained[i].on_pad = false;
+    }
+}
+
 int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
@@ -238,15 +268,102 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
     /* Command low byte carries the power state in bits [1:0], high byte the
      * SET_POWER opcode in bits [3:0]. No response follows. */
     uint8_t msg[4] = {data->command_reg, 0x00, state, I2C_HID_SET_POWER};
+    k_mutex_lock(&data->retained_lock, K_FOREVER);
     int err = tp_lock(data);
     if (err) {
+        k_mutex_unlock(&data->retained_lock);
         return err;
     }
     err = i2c_write_dt(&config->i2c_bus, msg, sizeof(msg));
     tp_unlock(data);
     if (err) {
+        k_mutex_unlock(&data->retained_lock);
         LOG_ERR("set_power %u failed: %d", state, err);
+        return err;
     }
+
+    /* Writing a sleeping pad could wake it, so retained writes wait for
+     * power-on. Whether the pad keeps its feature state through sleep is
+     * up to its firmware; don't depend on it. */
+    data->powered = state == I2C_HID_PWR_ON;
+    if (data->powered) {
+        tp_retained_lost_locked(data);
+        int rerr = tp_write_retained_locked(dev);
+        if (rerr) {
+            LOG_WRN("restoring retained features after power on failed: %d", rerr);
+        }
+    }
+    k_mutex_unlock(&data->retained_lock);
+    return 0;
+}
+
+/* The pad signalled a reset (ESD, brown-out, its own watchdog) and is back
+ * in its power-on modes while the retained values still read as on it. Off
+ * the input path: the writes wait for retained_lock. */
+static void tp_reset_work_cb(struct k_work *work) {
+    struct hid_touchpad_data *data = CONTAINER_OF(work, struct hid_touchpad_data, reset_work);
+
+    k_mutex_lock(&data->retained_lock, K_FOREVER);
+    tp_retained_lost_locked(data);
+    int err = tp_write_retained_locked(data->dev);
+    k_mutex_unlock(&data->retained_lock);
+    if (err) {
+        LOG_WRN("restoring retained features after pad reset failed: %d", err);
+    }
+}
+
+int hid_touchpad_retain_feature(const struct device *dev, uint8_t id, uint8_t value) {
+    struct hid_touchpad_data *data = dev->data;
+
+    k_mutex_lock(&data->retained_lock, K_FOREVER);
+    size_t i;
+    for (i = 0; i < data->num_retained; i++) {
+        if (data->retained[i].id == id) {
+            break;
+        }
+    }
+    if (i == data->num_retained) {
+        if (i == ARRAY_SIZE(data->retained)) {
+            k_mutex_unlock(&data->retained_lock);
+            LOG_ERR("can't retain feature %u: HID_TOUCHPAD_MAX_RETAINED reached", id);
+            return -ENOMEM;
+        }
+        data->retained[i].id = id;
+        data->retained[i].on_pad = false;
+        data->num_retained++;
+    }
+    if (data->retained[i].value != value) {
+        data->retained[i].value = value;
+        data->retained[i].on_pad = false;
+    }
+    int err = tp_write_retained_locked(dev);
+    k_mutex_unlock(&data->retained_lock);
+    return err;
+}
+
+int hid_touchpad_restore_retained(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+
+    k_mutex_lock(&data->retained_lock, K_FOREVER);
+    /* A reset pad comes back powered on. */
+    data->powered = true;
+    tp_retained_lost_locked(data);
+    int err = tp_write_retained_locked(dev);
+    k_mutex_unlock(&data->retained_lock);
+    return err;
+}
+
+int hid_touchpad_hold_retained(const struct device *dev, bool hold) {
+    struct hid_touchpad_data *data = dev->data;
+
+    k_mutex_lock(&data->retained_lock, K_FOREVER);
+    data->retained_held = hold;
+    int err = 0;
+    if (!hold) {
+        tp_retained_lost_locked(data);
+        err = tp_write_retained_locked(dev);
+    }
+    k_mutex_unlock(&data->retained_lock);
     return err;
 }
 
@@ -340,8 +457,16 @@ static int hid_touchpad_report_data(const struct device *dev) {
     }
 
     uint16_t report_len = sys_get_le16(data->report_buf);
-    if (report_len == 0 || report_len == 0xFFFF) {
-        /* Reset signal or no data */
+    if (report_len == 0xFFFF) {
+        /* No data */
+        return 0;
+    }
+    if (report_len == 0) {
+        /* Reset signal */
+        if (data->num_retained > 0) {
+            LOG_INF("pad reset; writing retained features again");
+            k_work_submit(&data->reset_work);
+        }
         return 0;
     }
     if (report_len < 3) {
@@ -557,6 +682,8 @@ static int hid_touchpad_init(const struct device *dev) {
      * usable mutex in case a caller ignores device_is_ready(). */
     k_mutex_init(&data->lock);
     data->claim_owner = NULL;
+    k_mutex_init(&data->retained_lock);
+    k_work_init(&data->reset_work, tp_reset_work_cb);
 
     if (!device_is_ready(config->i2c_bus.bus)) {
         LOG_WRN("i2c bus not ready!");
@@ -584,6 +711,7 @@ static int hid_touchpad_init(const struct device *dev) {
     if (err) {
         LOG_WRN("SET_POWER on at init failed: %d", err);
     }
+    data->powered = true;
 
     data->dev = dev;
 

@@ -44,6 +44,17 @@ typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report
 /* USB + BLE passthroughs, plus one for the application (daisy's activity hook). */
 #define HID_TOUCHPAD_MAX_CBS 3
 
+/* One-byte feature reports held across pad power transitions
+ * (hid_touchpad_retain_feature); the host-owned PTP reports need three. */
+#define HID_TOUCHPAD_MAX_RETAINED 4
+
+struct hid_touchpad_retained {
+    uint8_t id;
+    uint8_t value;
+    /* The pad was written `value` since it was last powered on or reset. */
+    bool on_pad;
+};
+
 struct hid_touchpad_data {
     const struct device *dev;
     uint8_t command_reg;
@@ -59,6 +70,19 @@ struct hid_touchpad_data {
     struct k_mutex lock;
     /* Thread holding an exclusive claim (hid_touchpad_claim), or NULL. */
     k_tid_t claim_owner;
+    /* Not `lock`: a value must be recorded even while the pad is claimed,
+     * so the claim owner's restore picks it up. Held across the retained
+     * writes, so a restore can't put back a value replaced meanwhile. Taken
+     * before `lock`, never while holding it. */
+    struct k_mutex retained_lock;
+    struct hid_touchpad_retained retained[HID_TOUCHPAD_MAX_RETAINED];
+    uint8_t num_retained;
+    /* The last SET_POWER was on, so the pad takes the retained writes. */
+    bool powered;
+    /* hid_touchpad_hold_retained(): record retained values, write none. */
+    bool retained_held;
+    /* Writes the retained values again after the pad reset itself. */
+    struct k_work reset_work;
 };
 
 /**
@@ -113,8 +137,50 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
                             const uint8_t *data, uint16_t len);
 
 /**
+ * Hold a one-byte feature report at `value`, so it survives whatever the pad
+ * does to its state across power transitions. Replaces the value held for
+ * `id` if there is one.
+ *
+ * Writes the report only when the pad doesn't already hold `value` and is
+ * powered on: a pad in SET_POWER sleep is left asleep, and gets every held
+ * value written on the next SET_POWER on, after a PixArt firmware update,
+ * when the pad signals a reset of its own and on
+ * hid_touchpad_restore_retained(). The value is recorded even when the
+ * write fails (e.g. -EBUSY while the pad is claimed), and the write is
+ * retried on the next call or restore.
+ *
+ * @return 0 if the pad holds `value` or will get it on power-on, the write's
+ *         error, or -ENOMEM when HID_TOUCHPAD_MAX_RETAINED reports are
+ *         already held.
+ */
+int hid_touchpad_retain_feature(const struct device *dev, uint8_t id, uint8_t value);
+
+/**
+ * Write every report held by hid_touchpad_retain_feature() to a pad that was
+ * just reset, so is powered on and has lost them.
+ * hid_touchpad_set_power(I2C_HID_PWR_ON), pixart_tp_update() and the pad's
+ * own reset signal already do this; call it after anything else that resets
+ * the pad. Writes nothing
+ * while the retained values are held back.
+ * @return 0, or the first failed write's error (the rest are still tried).
+ */
+int hid_touchpad_restore_retained(const struct device *dev);
+
+/**
+ * Stop writing retained feature reports to the pad (`hold` true), e.g. while
+ * a test tool sets the pad's modes itself: hid_touchpad_retain_feature()
+ * only records, and power-on and restore write nothing. Releasing writes
+ * every held value, since the pad's own may have been changed meanwhile.
+ * @return 0, or on release the first failed write's error.
+ */
+int hid_touchpad_hold_retained(const struct device *dev, bool hold);
+
+/**
  * Issue an I2C HID SET_POWER command (I2C_HID_PWR_ON / I2C_HID_PWR_SLEEP).
  * The device sends no response; per spec it must transition within 1 s.
+ * After a successful I2C_HID_PWR_ON the retained feature reports are
+ * restored (hid_touchpad_restore_retained); after I2C_HID_PWR_SLEEP they are
+ * only recorded until then.
  */
 int hid_touchpad_set_power(const struct device *dev, uint8_t state);
 

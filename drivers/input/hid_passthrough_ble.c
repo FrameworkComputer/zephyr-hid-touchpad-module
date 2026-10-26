@@ -18,6 +18,7 @@
 #include <zmk/events/ble_active_profile_changed.h>
 
 #include "hid_touchpad.h"
+#include "hid_passthrough_hosts.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_HID_PASSTHROUGH_BLE_LOG_LEVEL);
@@ -159,8 +160,12 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
     if (!cached) {
         uint16_t out_len = 0;
         feature_buf_len = 0;
-        int err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
+        int err = tp_hosts_get_feature(tp_hosts_from_conn(conn), ref->id, feature_buf,
+                                       sizeof(feature_buf), &out_len);
+        if (err == -ENOENT) {
+            err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
                                           feature_buf, sizeof(feature_buf), &out_len);
+        }
         if (err) {
             LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
             return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
@@ -202,7 +207,10 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
 
-    int err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
+    int err = tp_hosts_set_feature(tp_hosts_from_conn(conn), ref->id, buf, len);
+    if (err == -ENOENT) {
+        err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
+    }
     if (err) {
         LOG_ERR("BLE set feature report %d failed: %d", ref->id, err);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);

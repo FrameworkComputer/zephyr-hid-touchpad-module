@@ -97,6 +97,51 @@ fixed hosts discard the extra byte), `HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE`,
 `HID_TOUCHPAD_WORKQUEUE_*`, and `HID_TOUCHPAD_INPUT_STATS` (1 Hz frame-rate /
 I2C timing diagnostic, off by default).
 
+## Several hosts, one pad
+
+USB stays enumerated while BLE is selected, and every bonded BLE profile
+stays connected while another is selected, so several hosts' touchpad
+drivers write the pad's mode reports. Linux and Windows switch it to PTP;
+macOS never does and needs mouse mode. Name those reports and their
+power-on values on the touchpad node:
+
+```dts
+host-state-report-ids = <3 5 7>;            /* Input Mode, Surface/Button Switch, Latency Mode */
+host-state-report-defaults = [00 03 00];    /* mouse mode, both switches on, normal latency */
+host-state-saved-report-ids = <3>;          /* kept across keyboard resets */
+```
+
+That enables `CONFIG_HID_PASSTHROUGH_HOST_STATE`. USB and each BLE profile
+then get their own copy of those reports: a host's SETs and GETs go to its
+copy, and only the selected host's copy is written to the pad, again on
+every endpoint or profile switch. A host that never wrote a report gets the
+default, so a Mac selected after a Linux host gets mouse mode. Every other
+feature report still goes straight to the pad.
+
+The USB copy goes back to the defaults when the bus is reset or
+deconfigured; the host writes its own again when it re-enumerates. A failed
+pad write doesn't fail the host's SET (the value is in its copy) and is
+retried a few times, a second apart. A BLE profile's copy is
+kept until the profile's bond changes. Its `host-state-saved-report-ids`
+are also saved to settings, once per change, and survive a keyboard reset,
+in case a bonded host doesn't re-send them when it reconnects. Leave out
+reports a host toggles around every suspend (Surface/Button Switch, Latency
+Mode): saving them would write flash daily, and hosts re-send them anyway.
+
+A board whose test tool sets the pad's modes itself calls
+`tp_hosts_hold(true)` for the duration (`hid_passthrough_hosts.h`): every
+host's GETs and SETs then go straight to the pad again.
+
+The driver side, usable without ZMK, is `hid_touchpad_retain_feature()`:
+it holds a one-byte feature report at a value, writing it only when the pad
+doesn't hold it yet and isn't in SET_POWER sleep, and again after every
+`hid_touchpad_set_power(dev, I2C_HID_PWR_ON)`, `pixart_tp_update()` and
+every reset signal from the pad, so the value survives whatever the pad does
+across power transitions and resets of its own.
+`hid_touchpad_restore_retained()` does the same after anything else that
+resets the pad, and `hid_touchpad_hold_retained()` stops the writes while a
+test tool has the pad.
+
 ## Exclusive access and firmware update
 
 Every I2C transaction the driver issues is serialised by one mutex. For a
