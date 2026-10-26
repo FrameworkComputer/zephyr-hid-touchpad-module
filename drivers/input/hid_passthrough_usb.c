@@ -11,6 +11,7 @@
 #include <zephyr/usb/class/usb_hid.h>
 
 #include "hid_touchpad.h"
+#include "hid_passthrough_hosts.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
@@ -55,8 +56,15 @@ static int get_report_cb(const struct device *dev, struct usb_setup_packet *setu
     uint16_t out_len = 0;
 
     report_buf[0] = report_id;
-    int err = hid_touchpad_get_report(tp_dev, i2c_type, report_id,
+    int err = -ENOENT;
+    if (i2c_type == I2C_HID_REPORT_TYPE_FEATURE) {
+        err = tp_hosts_get_feature(TP_HOST_USB, report_id, report_buf + 1,
+                                   sizeof(report_buf) - 1, &out_len);
+    }
+    if (err == -ENOENT) {
+        err = hid_touchpad_get_report(tp_dev, i2c_type, report_id,
                                       report_buf + 1, sizeof(report_buf) - 1, &out_len);
+    }
     if (err) {
         LOG_ERR("get_report proxy failed for type=0x%02x id=%d: %d", i2c_type, report_id, err);
         return err;
@@ -87,8 +95,14 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
 
     /* Zephyr USB HID includes the report ID as the first byte of *data.
      * Skip it — hid_touchpad_set_report adds the report ID itself. */
-    int err = hid_touchpad_set_report(tp_dev, i2c_type, report_id,
+    int err = -ENOENT;
+    if (i2c_type == I2C_HID_REPORT_TYPE_FEATURE) {
+        err = tp_hosts_set_feature(TP_HOST_USB, report_id, *data + 1, *len - 1);
+    }
+    if (err == -ENOENT) {
+        err = hid_touchpad_set_report(tp_dev, i2c_type, report_id,
                                       *data + 1, *len - 1);
+    }
     if (err) {
         LOG_ERR("set_report proxy failed for type=0x%02x id=%d: %d", i2c_type, report_id, err);
         return err;

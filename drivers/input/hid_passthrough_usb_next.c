@@ -17,6 +17,7 @@
 #include <zmk/usb.h>
 
 #include "hid_touchpad.h"
+#include "hid_passthrough_hosts.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
@@ -33,6 +34,11 @@ static bool hid_ready;
 static void iface_ready_cb(const struct device *dev, const bool ready) {
     LOG_INF("TP HID interface %s", ready ? "ready" : "not ready");
     hid_ready = ready;
+    if (!ready) {
+        /* Bus reset, deconfigured or VBUS gone, each seen here even when a
+         * new configuration follows before ZMK's state event runs. */
+        tp_hosts_usb_reset();
+    }
 }
 
 static int get_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
@@ -65,7 +71,13 @@ static int get_report_cb(const struct device *dev, const uint8_t type, const uin
     buf[0] = id;
 
     uint16_t out_len = 0;
-    int err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf + 1, len - 1, &out_len);
+    int err = -ENOENT;
+    if (i2c_type == I2C_HID_REPORT_TYPE_FEATURE) {
+        err = tp_hosts_get_feature(TP_HOST_USB, id, buf + 1, len - 1, &out_len);
+    }
+    if (err == -ENOENT) {
+        err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf + 1, len - 1, &out_len);
+    }
     if (err) {
         LOG_ERR("get_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
         return err;
@@ -100,7 +112,13 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
     if (len < 1) {
         return -EINVAL;
     }
-    int err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf + 1, len - 1);
+    int err = -ENOENT;
+    if (i2c_type == I2C_HID_REPORT_TYPE_FEATURE) {
+        err = tp_hosts_set_feature(TP_HOST_USB, id, buf + 1, len - 1);
+    }
+    if (err == -ENOENT) {
+        err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf + 1, len - 1);
+    }
     if (err) {
         LOG_ERR("set_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
     }
