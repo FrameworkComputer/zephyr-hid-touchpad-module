@@ -400,13 +400,24 @@ void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input
     }
 }
 
+void hid_touchpad_set_input_filter(const struct device *dev, hid_touchpad_input_filter_t filter) {
+    struct hid_touchpad_data *data = dev->data;
+    data->input_filter = filter;
+}
+
+struct k_work_q *hid_touchpad_work_queue(void) { return &tp_workq; }
+
 /* Fan one input report out to the registered passthrough backends. Shared by
  * the I2C read path and hid_touchpad_inject_input() so a synthetic frame is
  * indistinguishable from a real one downstream. */
 static void tp_dispatch_input(const struct device *dev, uint8_t report_id, const uint8_t *data,
                               uint16_t len) {
     const struct hid_touchpad_data *tp = dev->data;
+    hid_touchpad_input_filter_t filter = tp->input_filter;
 
+    if (filter != NULL && filter(dev, report_id, data, len)) {
+        return;
+    }
     for (int i = 0; i < tp->num_cbs; i++) {
         if (tp->input_cbs[i]) {
             tp->input_cbs[i](dev, report_id, data, len);
