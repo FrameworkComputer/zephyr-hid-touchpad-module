@@ -11,6 +11,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/util.h>
+#include <stdlib.h>
 
 #include <zmk/ble.h>
 #include <zmk/endpoints.h>
@@ -286,6 +287,10 @@ BT_GATT_SERVICE_DEFINE(
 K_THREAD_STACK_DEFINE(tp_hog_q_stack, CONFIG_HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE);
 static struct k_work_q tp_hog_work_q;
 
+/* Per connection, the pad's notifications not sent on yet: see
+ * TP_MAX_IN_FLIGHT. */
+static atomic_t tp_in_flight[CONFIG_BT_MAX_CONN];
+
 /* Message queue entry: report_id + data */
 struct tp_report_msg {
     uint8_t report_id;
@@ -293,10 +298,50 @@ struct tp_report_msg {
     uint16_t len;
 };
 
-/* Mouse-mode (id 1) reports are RELATIVE — coalescing would lose deltas —
- * so they pass through this queue unpaced. Only hosts that never switch
- * the pad to PTP mode ever see them. */
-K_MSGQ_DEFINE(tp_report_msgq, sizeof(struct tp_report_msg), 8, 4);
+/* Mouse-mode (id 1) reports are RELATIVE, laid out as the descriptor has
+ * them: buttons in byte 0, then signed 8-bit X, Y, Wheel and AC Pan, then
+ * padding. Hosts that never switch the pad to PTP mode get them (macOS),
+ * and so do Mac hosts the keyboard reads PTP frames for (it injects its
+ * own).
+ *
+ * They used to go out one notification per report, unpaced. A host that
+ * slows the link -- macOS takes an idle keyboard's link to a 200 ms
+ * interval and leaves it there for a second or more after input resumes --
+ * then had ~140 reports/s queued for ~5 connection events/s: the ATT
+ * buffers ran out, and the cursor, the keys and every other host's link
+ * froze with them. So the link gets one at a time, timed by the link
+ * itself: when it has sent the last (tp_notify_sent), a connection event
+ * has just happened, and the next is due an interval later; the next
+ * report goes TP_MOUSE_LEAD before that, with all the motion since. That
+ * puts the newest motion in every connection event, and no more. (Paced
+ * like PTP frames instead, at the interval plus a margin, they drifted
+ * against the events: one skipped every ~30, and a report could wait most
+ * of an interval for the radio. Handed over as soon as the last had gone,
+ * every one would wait a whole interval.) A report waiting its turn
+ * absorbs the next one: motion summed, as long as the buttons are the
+ * same. A button change queues behind and, like a PTP tip or button
+ * change, doesn't wait for the one in flight; nor does the rest of motion
+ * beyond what one report carries (tp_mouse_urgent). When the queue is full
+ * the newest entry takes the change too: an intermediate press can be lost
+ * that way, never the final state. */
+#define TP_MOUSE_AXES_OFF  1
+#define TP_MOUSE_AXES      4
+#define TP_MOUSE_QUEUE_LEN 4
+BUILD_ASSERT(TP_MOUSE_INPUT_REPORT_SIZE >= TP_MOUSE_AXES_OFF + TP_MOUSE_AXES,
+             "mouse-input-report-size too small for buttons + X, Y, Wheel, AC Pan");
+
+struct tp_mouse_pending {
+    uint8_t buttons;
+    int32_t axes[TP_MOUSE_AXES];
+};
+
+/* Under tp_pending_lock. */
+static struct tp_mouse_pending tp_mouse_queue[TP_MOUSE_QUEUE_LEN];
+static uint8_t tp_mouse_head;
+static uint8_t tp_mouse_count;
+static uint8_t tp_mouse_sent_buttons;
+/* The oldest entry is going out in parts (tp_mouse_take). */
+static bool tp_mouse_splitting;
 
 /* PTP (id 4) frames carry ABSOLUTE positions, so only the newest pending
  * frame matters; older unsent motion is subsumed by it. Pure-motion frames
@@ -353,6 +398,15 @@ static bool tp_pending_valid;
 static bool tp_pending_urgent;
 static struct k_spinlock tp_pending_lock;
 static int64_t tp_last_send_ticks;
+/* The granted connection interval (0 = unknown), and when the next mouse
+ * report should go: TP_MOUSE_LEAD before the connection event after the
+ * one that sent the last. Under tp_pending_lock. */
+static k_ticks_t tp_interval_ticks;
+static k_ticks_t tp_mouse_next_ticks;
+/* How long before a connection event a mouse report is handed over: a
+ * third of the interval covers the notify-sent callback arriving late
+ * after the event that sent the last one, and the trip to the controller. */
+#define TP_MOUSE_LEAD(interval) ((interval) / 3)
 /* Current pace in ticks (0 = every frame goes out immediately); read and
  * written under tp_pending_lock. */
 static k_ticks_t tp_pace_ticks;
@@ -414,10 +468,11 @@ static void tp_pace_refresh(struct bt_conn *conn) {
     k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
     bool changed = ticks != tp_pace_ticks;
     tp_pace_ticks = ticks;
+    tp_interval_ticks = interval_us ? k_us_to_ticks_ceil64(interval_us) : 0;
     k_spin_unlock(&tp_pending_lock, key);
 
     if (changed) {
-        LOG_INF("PTP pace %u us (conn interval %u us%s)", TP_PACE_ENABLED ? pace_us : 0,
+        LOG_INF("Touchpad pace %u us (conn interval %u us%s)", TP_PACE_ENABLED ? pace_us : 0,
                 interval_us, interval_us ? "" : ", fallback");
     }
 }
@@ -429,12 +484,16 @@ static bool tp_conn_is_active_profile(struct bt_conn *conn) {
 }
 
 static void tp_conn_connected(struct bt_conn *conn, uint8_t err) {
+    if (err == 0) {
+        atomic_set(&tp_in_flight[bt_conn_index(conn)], 0);
+    }
     if (err == 0 && tp_conn_is_active_profile(conn)) {
         tp_pace_refresh(conn);
     }
 }
 
 static void tp_conn_disconnected(struct bt_conn *conn, uint8_t reason) {
+    atomic_set(&tp_in_flight[bt_conn_index(conn)], 0);
     if (tp_conn_is_active_profile(conn)) {
         tp_pace_refresh(NULL);
     }
@@ -470,7 +529,148 @@ static int tp_profile_changed_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(hid_passthrough_ble, tp_profile_changed_listener);
 ZMK_SUBSCRIPTION(hid_passthrough_ble, zmk_ble_active_profile_changed);
 
-static void tp_notify_conns(const struct tp_report_msg *msg) {
+/* Add a mouse report to the queue. Caller holds tp_pending_lock. */
+static void tp_mouse_add(const uint8_t *data, uint16_t len) {
+    uint8_t buttons = len > 0 ? data[0] : 0;
+    struct tp_mouse_pending *last = NULL;
+
+    if (tp_mouse_count > 0) {
+        last = &tp_mouse_queue[(tp_mouse_head + tp_mouse_count - 1) % TP_MOUSE_QUEUE_LEN];
+    }
+    if (last == NULL || (last->buttons != buttons && tp_mouse_count < TP_MOUSE_QUEUE_LEN)) {
+        last = &tp_mouse_queue[(tp_mouse_head + tp_mouse_count) % TP_MOUSE_QUEUE_LEN];
+        memset(last, 0, sizeof(*last));
+        tp_mouse_count++;
+    }
+    last->buttons = buttons;
+    for (int i = 0; i < TP_MOUSE_AXES && TP_MOUSE_AXES_OFF + i < len; i++) {
+        last->axes[i] += (int8_t)data[TP_MOUSE_AXES_OFF + i];
+    }
+}
+
+/* Whether the next mouse report shouldn't wait for the one in flight: it
+ * changes the buttons the host has, or it is the rest of an entry that held
+ * more motion than one report carries. A fast flick on a 15 ms link would
+ * otherwise be held to 127 counts per interval and arrive long after the
+ * finger stopped; its parts go out back to back instead, as fast as
+ * TP_MAX_IN_FLIGHT lets them. Caller holds tp_pending_lock. */
+static bool tp_mouse_urgent(void) {
+    if (tp_mouse_count == 0) {
+        return false;
+    }
+    const struct tp_mouse_pending *p = &tp_mouse_queue[tp_mouse_head];
+    return p->buttons != tp_mouse_sent_buttons || tp_mouse_splitting;
+}
+
+/* The next mouse report from the oldest entry.
+ *
+ * More motion than the report's int8 fields hold goes in equal parts, the
+ * entry staying until all have gone: macOS accelerates each report by its
+ * size, so 127 and then a few would arrive as a big step and a small one.
+ * Caller holds tp_pending_lock. */
+static void tp_mouse_take(struct tp_report_msg *msg) {
+    struct tp_mouse_pending *p = &tp_mouse_queue[tp_mouse_head];
+    int32_t parts = 1;
+    bool rest = false;
+
+    for (int i = 0; i < TP_MOUSE_AXES; i++) {
+        parts = MAX(parts, DIV_ROUND_UP(abs(p->axes[i]), 127));
+    }
+    memset(msg, 0, sizeof(*msg));
+    msg->report_id = TP_MOUSE_INPUT_REPORT_ID;
+    msg->len = TP_MOUSE_INPUT_REPORT_SIZE;
+    msg->data[0] = p->buttons;
+    for (int i = 0; i < TP_MOUSE_AXES; i++) {
+        int32_t v = p->axes[i] / parts;
+        msg->data[TP_MOUSE_AXES_OFF + i] = (uint8_t)(int8_t)v;
+        p->axes[i] -= v;
+        rest = rest || p->axes[i] != 0;
+    }
+    tp_mouse_sent_buttons = p->buttons;
+    tp_mouse_splitting = parts > 1;
+    if (!rest) {
+        tp_mouse_head = (tp_mouse_head + 1) % TP_MOUSE_QUEUE_LEN;
+        tp_mouse_count--;
+    }
+}
+
+/* Touchpad notifications handed to the stack and not sent on yet, per
+ * connection. ATT has CONFIG_BT_ATT_TX_COUNT buffers for everything every
+ * host gets -- keys, the pad, responses to the host's requests -- and a
+ * notify that finds none blocks this queue until one frees, however long
+ * that takes. Holding the pad to TP_MAX_IN_FLIGHT leaves the rest to the
+ * others when a link stops draining; the pad's reports wait here meanwhile,
+ * merged (mouse) or replaced by the newest (PTP).
+ *
+ * tp_notify_sent counts them back down. Zephyr doesn't call it for a
+ * notification whose link went away, so a disconnect zeroes its count. */
+#define TP_MAX_IN_FLIGHT 2
+BUILD_ASSERT(CONFIG_BT_ATT_TX_COUNT > TP_MAX_IN_FLIGHT,
+             "the touchpad would be allowed every ATT TX buffer");
+
+/* When the pad last found its link's quota full with nothing coming back,
+ * for a warning that names the link once that has gone on for a while.
+ * Only the TP HOG queue touches these. */
+#define TP_HELD_WARN_MS 1000
+static int64_t tp_held_since;
+static bool tp_held_warned;
+
+static void tp_held(struct bt_conn *conn) {
+    int64_t now = k_uptime_get();
+
+    if (tp_held_since == 0) {
+        tp_held_since = now;
+    } else if (!tp_held_warned && now - tp_held_since >= TP_HELD_WARN_MS) {
+        struct bt_conn_info info;
+        char addr[BT_ADDR_LE_STR_LEN];
+
+        bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+        bool ok = bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE;
+        LOG_WRN("Touchpad held %d ms: %s isn't taking notifications (interval %u us, "
+                "latency %u)",
+                (int)(now - tp_held_since), addr, ok ? info.le.interval_us : 0,
+                ok ? info.le.latency : 0);
+        tp_held_warned = true;
+    }
+}
+
+static void tp_unheld(void) {
+    if (tp_held_warned) {
+        LOG_INF("Touchpad notifications flowing again after %d ms",
+                (int)(k_uptime_get() - tp_held_since));
+    }
+    tp_held_since = 0;
+    tp_held_warned = false;
+}
+
+static void send_tp_report_callback(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(tp_send_work, send_tp_report_callback);
+
+static void tp_notify_sent(struct bt_conn *conn, void *user_data) {
+    atomic_t *n = &tp_in_flight[bt_conn_index(conn)];
+
+    if ((uintptr_t)user_data == TP_MOUSE_INPUT_REPORT_ID) {
+        k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+        if (tp_interval_ticks > 0) {
+            tp_mouse_next_ticks =
+                k_uptime_ticks() + tp_interval_ticks - TP_MOUSE_LEAD(tp_interval_ticks);
+        }
+        k_spin_unlock(&tp_pending_lock, key);
+    }
+
+    /* Not below zero: a disconnect may have zeroed it already. */
+    for (atomic_val_t v = atomic_get(n); v > 0; v = atomic_get(n)) {
+        if (atomic_cas(n, v, v - 1)) {
+            break;
+        }
+    }
+    k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);
+}
+
+/* Notify the selected profile's central (conn), mirroring ZMK's keyboard
+ * HOG (zmk_ble_active_profile_conn). Fanning out to every connected LE
+ * central would mirror the pad to all bonded hosts at once. */
+static void tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
     const struct bt_gatt_attr *attr;
     if (msg->report_id == TP_MOUSE_INPUT_REPORT_ID) {
         attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
@@ -484,18 +684,12 @@ static void tp_notify_conns(const struct tp_report_msg *msg) {
         return;
     }
 
-    /* Notify only the central for the currently selected BLE profile, mirroring
-     * ZMK's keyboard HOG (zmk_ble_active_profile_conn). Fanning out to every
-     * connected LE central would mirror the pad to all bonded hosts at once. */
-    struct bt_conn *conn = zmk_ble_active_profile_conn();
-    if (conn == NULL) {
-        return;
-    }
-
     struct bt_gatt_notify_params notify_params = {
         .attr = attr,
         .data = msg->data,
         .len = msg->len,
+        .func = tp_notify_sent,
+        .user_data = (void *)(uintptr_t)msg->report_id,
     };
 
     /* A failed notify is a dropped frame (e.g. -ENOMEM = ATT TX buffer
@@ -504,7 +698,11 @@ static void tp_notify_conns(const struct tp_report_msg *msg) {
      * CCC not yet enabled (fresh bond mid-enumeration) this fails for every
      * frame, and a WRN per frame at ~130 Hz drowns the log. */
     static bool notify_failing;
+    atomic_inc(&tp_in_flight[bt_conn_index(conn)]);
     int err = bt_gatt_notify_cb(conn, &notify_params);
+    if (err) {
+        atomic_dec(&tp_in_flight[bt_conn_index(conn)]);
+    }
     if (err == -EPERM) {
         bt_conn_set_security(conn, BT_SECURITY_L2);
     } else if (err) {
@@ -518,42 +716,79 @@ static void tp_notify_conns(const struct tp_report_msg *msg) {
         notify_failing = false;
         LOG_INF("Notifications flowing again");
     }
-
-    bt_conn_unref(conn);
 }
 
-static void send_tp_report_callback(struct k_work *work);
-static K_WORK_DELAYABLE_DEFINE(tp_send_work, send_tp_report_callback);
-
+/* Send the next pending report -- mouse, else PTP -- when the link is
+ * about to take it (mouse) or the pace allows (PTP), within its in-flight
+ * quota, and come back for the rest. */
 static void send_tp_report_callback(struct k_work *work) {
     struct tp_report_msg msg;
-
-    /* Unpaced mouse-mode reports first */
-    while (k_msgq_get(&tp_report_msgq, &msg, K_NO_WAIT) == 0) {
-        tp_notify_conns(&msg);
-    }
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
 
     k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
-    if (!tp_pending_valid) {
+    if (conn == NULL) {
+        /* No one to send to; what's pending would only arrive stale. */
+        tp_mouse_count = 0;
+        tp_mouse_splitting = false;
+        tp_pending_valid = false;
+        tp_pending_urgent = false;
         k_spin_unlock(&tp_pending_lock, key);
         return;
     }
-    k_ticks_t due = tp_last_send_ticks + tp_pace_ticks - k_uptime_ticks();
-    if (tp_pace_ticks > 0 && !tp_pending_urgent && due > 0) {
+    bool mouse = tp_mouse_count > 0;
+    if (!mouse && !tp_pending_valid) {
+        k_spin_unlock(&tp_pending_lock, key);
+        bt_conn_unref(conn);
+        return;
+    }
+    if (atomic_get(&tp_in_flight[bt_conn_index(conn)]) >= TP_MAX_IN_FLIGHT) {
+        /* tp_notify_sent brings us back. */
+        k_spin_unlock(&tp_pending_lock, key);
+        tp_held(conn);
+        bt_conn_unref(conn);
+        return;
+    }
+    bool urgent = mouse ? tp_mouse_urgent() : tp_pending_urgent;
+    if (mouse && !urgent && atomic_get(&tp_in_flight[bt_conn_index(conn)]) > 0) {
+        /* tp_notify_sent brings us back. */
+        k_spin_unlock(&tp_pending_lock, key);
+        bt_conn_unref(conn);
+        return;
+    }
+    k_ticks_t due = mouse ? tp_mouse_next_ticks - k_uptime_ticks()
+                          : tp_last_send_ticks + tp_pace_ticks - k_uptime_ticks();
+    if (mouse && !urgent && due > 0) {
+        k_spin_unlock(&tp_pending_lock, key);
+        k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_TICKS(due));
+        bt_conn_unref(conn);
+        return;
+    }
+    if (!mouse && tp_pace_ticks > 0 && !urgent && due > 0) {
         k_spin_unlock(&tp_pending_lock, key);
         /* schedule (not reschedule): never push out an earlier deadline */
         k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_TICKS(due));
+        bt_conn_unref(conn);
         return;
     }
-    msg = tp_pending;
-    tp_pending_valid = false;
-    tp_pending_urgent = false;
+    if (mouse) {
+        tp_mouse_take(&msg);
+    } else {
+        msg = tp_pending;
+        tp_pending_valid = false;
+        tp_pending_urgent = false;
+        /* ~10 loads; cheap enough to keep under the lock (see tp_sent_state) */
+        tp_frame_state(msg.data, msg.len, tp_sent_state);
+    }
     tp_last_send_ticks = k_uptime_ticks();
-    /* ~10 loads; cheap enough to keep under the lock (see tp_sent_state) */
-    tp_frame_state(msg.data, msg.len, tp_sent_state);
+    bool more = tp_mouse_count > 0 || tp_pending_valid;
     k_spin_unlock(&tp_pending_lock, key);
 
-    tp_notify_conns(&msg);
+    tp_unheld();
+    tp_notify(conn, &msg);
+    bt_conn_unref(conn);
+    if (more) {
+        k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);
+    }
 }
 
 static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
@@ -566,15 +801,10 @@ static void tp_ble_input_cb(const struct device *dev, uint8_t report_id,
     }
 
     if (report_id == TP_MOUSE_INPUT_REPORT_ID) {
-        struct tp_report_msg msg;
-        msg.report_id = report_id;
-        msg.len = MIN(len, sizeof(msg.data));
-        memcpy(msg.data, data, msg.len);
+        k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+        tp_mouse_add(data, len);
+        k_spin_unlock(&tp_pending_lock, key);
 
-        if (k_msgq_put(&tp_report_msgq, &msg, K_NO_WAIT) != 0) {
-            LOG_WRN("TP report queue full, dropping report ID %d", report_id);
-            return;
-        }
         k_work_reschedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);
         return;
     }
