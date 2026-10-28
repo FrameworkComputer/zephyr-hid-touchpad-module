@@ -19,6 +19,7 @@
 #include <zmk/events/ble_active_profile_changed.h>
 
 #include "hid_touchpad.h"
+#include "hid_passthrough_ble.h"
 #include "hid_passthrough_hosts.h"
 
 #include <zephyr/logging/log.h>
@@ -342,6 +343,16 @@ static uint8_t tp_mouse_count;
 static uint8_t tp_mouse_sent_buttons;
 /* The oldest entry is going out in parts (tp_mouse_take). */
 static bool tp_mouse_splitting;
+/* Whether tp_mouse_take resamples (hid_passthrough_ble_resample_mouse),
+ * and what by: the newest frame's motion (reports arriving within
+ * TP_MOUSE_SAME_FRAME of each other are one frame, split), when it
+ * arrived, and the frames' period. */
+static bool tp_mouse_resample;
+static int32_t tp_mouse_frame_axes[TP_MOUSE_AXES];
+static k_ticks_t tp_mouse_frame_ticks;
+static k_ticks_t tp_mouse_period_ticks;
+#define TP_MOUSE_SAME_FRAME k_us_to_ticks_ceil64(1000)
+#define TP_MOUSE_PERIOD_MAX k_ms_to_ticks_ceil64(30)
 
 /* PTP (id 4) frames carry ABSOLUTE positions, so only the newest pending
  * frame matters; older unsent motion is subsumed by it. Pure-motion frames
@@ -543,8 +554,21 @@ static void tp_mouse_add(const uint8_t *data, uint16_t len) {
         tp_mouse_count++;
     }
     last->buttons = buttons;
+
+    k_ticks_t now = k_uptime_ticks();
+    k_ticks_t gap = now - tp_mouse_frame_ticks;
+    if (gap >= TP_MOUSE_SAME_FRAME) {
+        if (gap < TP_MOUSE_PERIOD_MAX) {
+            tp_mouse_period_ticks = tp_mouse_period_ticks
+                                        ? tp_mouse_period_ticks + (gap - tp_mouse_period_ticks) / 4
+                                        : gap;
+        }
+        memset(tp_mouse_frame_axes, 0, sizeof(tp_mouse_frame_axes));
+        tp_mouse_frame_ticks = now;
+    }
     for (int i = 0; i < TP_MOUSE_AXES && TP_MOUSE_AXES_OFF + i < len; i++) {
         last->axes[i] += (int8_t)data[TP_MOUSE_AXES_OFF + i];
+        tp_mouse_frame_axes[i] += (int8_t)data[TP_MOUSE_AXES_OFF + i];
     }
 }
 
@@ -564,34 +588,63 @@ static bool tp_mouse_urgent(void) {
 
 /* The next mouse report from the oldest entry.
  *
+ * Resampled by time, when the board asks: the pad's frames (7.1 ms) don't
+ * line up with connection events (7.5 to 15 ms), so as many frames as fall
+ * between two events would go in each -- on an 11.25 ms link one, then
+ * two, then one, a step and a double step, over and over in a fast circle,
+ * which macOS's acceleration widens further. Taking each frame's motion as
+ * spread over the frame period before it arrived, a report carries the
+ * motion up to one period ago, holding back the part of the newest frame
+ * after that; every report then covers the same time. It costs one frame
+ * period of delay. Not across a button change: an older entry goes whole.
+ *
  * More motion than the report's int8 fields hold goes in equal parts, the
  * entry staying until all have gone: macOS accelerates each report by its
  * size, so 127 and then a few would arrive as a big step and a small one.
  * Caller holds tp_pending_lock. */
 static void tp_mouse_take(struct tp_report_msg *msg) {
     struct tp_mouse_pending *p = &tp_mouse_queue[tp_mouse_head];
+    int32_t avail[TP_MOUSE_AXES];
     int32_t parts = 1;
     bool rest = false;
 
+    k_ticks_t since = k_uptime_ticks() - tp_mouse_frame_ticks;
+    k_ticks_t period = tp_mouse_period_ticks;
+    bool resample = tp_mouse_resample && tp_mouse_count == 1 && period > 0 && since < period;
+
     for (int i = 0; i < TP_MOUSE_AXES; i++) {
-        parts = MAX(parts, DIV_ROUND_UP(abs(p->axes[i]), 127));
+        int32_t held = resample ? tp_mouse_frame_axes[i] * (period - since) / period : 0;
+
+        /* Not more than is left: part of the frame may have gone already. */
+        if ((held > 0 && held > p->axes[i]) || (held < 0 && held < p->axes[i])) {
+            held = p->axes[i];
+        }
+        avail[i] = p->axes[i] - held;
+        parts = MAX(parts, DIV_ROUND_UP(abs(avail[i]), 127));
     }
     memset(msg, 0, sizeof(*msg));
     msg->report_id = TP_MOUSE_INPUT_REPORT_ID;
     msg->len = TP_MOUSE_INPUT_REPORT_SIZE;
     msg->data[0] = p->buttons;
     for (int i = 0; i < TP_MOUSE_AXES; i++) {
-        int32_t v = p->axes[i] / parts;
+        int32_t v = avail[i] / parts;
         msg->data[TP_MOUSE_AXES_OFF + i] = (uint8_t)(int8_t)v;
         p->axes[i] -= v;
         rest = rest || p->axes[i] != 0;
     }
     tp_mouse_sent_buttons = p->buttons;
+    /* What's held back waits for the next event; only parts go at once. */
     tp_mouse_splitting = parts > 1;
     if (!rest) {
         tp_mouse_head = (tp_mouse_head + 1) % TP_MOUSE_QUEUE_LEN;
         tp_mouse_count--;
     }
+}
+
+void hid_passthrough_ble_resample_mouse(bool on) {
+    k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+    tp_mouse_resample = on;
+    k_spin_unlock(&tp_pending_lock, key);
 }
 
 /* Touchpad notifications handed to the stack and not sent on yet, per
