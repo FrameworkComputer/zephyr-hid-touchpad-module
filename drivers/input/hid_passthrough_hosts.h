@@ -45,6 +45,16 @@ int tp_hosts_get_feature(int host, uint8_t id, uint8_t *buf, uint16_t buf_len,
                          uint16_t *out_len);
 
 /**
+ * Put `value` on the pad for host-state report `id` whichever host is
+ * selected, e.g. PTP Input Mode for firmware that reads the pad's PTP frames
+ * itself on behalf of a host without a PTP driver. The hosts' copies are
+ * untouched and still answer their GETs; a negative `value` hands the pad
+ * back to the selected host's copy.
+ * @return -ENOENT if `id` is not a host-state report.
+ */
+int tp_hosts_override(uint8_t id, int value);
+
+/**
  * Hand the pad to a test tool that sets its modes itself (`hold` true):
  * every host's feature GETs and SETs go straight to the pad, and no host's
  * copy is written to it. Releasing writes the selected host's copy again.
@@ -71,6 +81,8 @@ static inline int tp_hosts_get_feature(int host, uint8_t id, uint8_t *buf, uint1
                                        uint16_t *out_len) {
     return -ENOENT;
 }
+
+static inline int tp_hosts_override(uint8_t id, int value) { return -ENOENT; }
 
 static inline void tp_hosts_hold(bool hold) {}
 

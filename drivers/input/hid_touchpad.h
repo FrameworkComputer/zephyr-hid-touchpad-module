@@ -41,6 +41,10 @@ struct hid_touchpad_config {
 typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report_id,
                                         const uint8_t *data, uint16_t len);
 
+/* Returns true when it consumed the report, so no input callback sees it. */
+typedef bool (*hid_touchpad_input_filter_t)(const struct device *dev, uint8_t report_id,
+                                            const uint8_t *data, uint16_t len);
+
 /* USB + BLE passthroughs, plus one for the application (daisy's activity hook). */
 #define HID_TOUCHPAD_MAX_CBS 3
 
@@ -64,6 +68,7 @@ struct hid_touchpad_data {
     struct k_work work;
     hid_touchpad_input_cb_t input_cbs[HID_TOUCHPAD_MAX_CBS];
     uint8_t num_cbs;
+    hid_touchpad_input_filter_t input_filter;
     uint8_t report_buf[64];
     /* Serialises every I2C transaction the driver issues (input reads,
      * GET/SET_REPORT, SET_POWER, raw registers). */
@@ -91,6 +96,21 @@ struct hid_touchpad_data {
  * block briefly (bounded), but every ms spent here delays the next report.
  */
 void hid_touchpad_register_input_cb(const struct device *dev, hid_touchpad_input_cb_t cb);
+
+/**
+ * Let `filter` see every input report before the input callbacks do, e.g.
+ * for firmware that turns the pad's PTP frames into reports of its own and
+ * sends those with hid_touchpad_inject_input() (which `filter` sees too).
+ * One filter; NULL removes it. Runs where the callbacks would: keep it short.
+ */
+void hid_touchpad_set_input_filter(const struct device *dev, hid_touchpad_input_filter_t filter);
+
+/**
+ * The driver's own work queue, which reads the pad and runs the input
+ * filter and callbacks. Work submitted here is serialised with them, and
+ * isn't held up by the system workqueue's HID submits.
+ */
+struct k_work_q *hid_touchpad_work_queue(void);
 
 /**
  * Feed a synthetic input report to every registered callback, exactly as if

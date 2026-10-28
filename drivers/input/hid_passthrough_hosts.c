@@ -116,6 +116,15 @@ static const struct device *tp_dev;
 /* tp_hosts_hold(): forward everything to the pad as before. Under
  * hosts_lock. */
 static bool held;
+/* tp_hosts_override(): the value the pad gets instead of the selected
+ * host's, or -1. Under hosts_lock. */
+static int16_t override[TP_STATES] = {[0 ... TP_STATES - 1] = -1};
+
+/* What the pad gets for report index `i` while `host` is selected. Caller
+ * holds hosts_lock. */
+static uint8_t pad_value(int host, size_t i) {
+    return override[i] >= 0 ? override[i] : hosts[host].val[i];
+}
 
 static int state_index(uint8_t id) {
     for (size_t i = 0; i < TP_STATES; i++) {
@@ -338,7 +347,7 @@ int tp_hosts_set_feature(int host, uint8_t id, const uint8_t *data, uint16_t len
     }
     int err = 0;
     if (host == selected_host()) {
-        err = hid_touchpad_retain_feature(tp_dev, id, data[0]);
+        err = hid_touchpad_retain_feature(tp_dev, id, pad_value(host, i));
     }
     k_mutex_unlock(&hosts_lock);
     if (err) {
@@ -346,6 +355,24 @@ int tp_hosts_set_feature(int host, uint8_t id, const uint8_t *data, uint16_t len
          * Windows host that saw an error might give up on PTP. */
         LOG_WRN("host %d: writing feature %u failed: %d", host, id, err);
         retry_later();
+    }
+    return 0;
+}
+
+int tp_hosts_override(uint8_t id, int value) {
+    int i = state_index(id);
+    if (i < 0) {
+        return -ENOENT;
+    }
+
+    k_mutex_lock(&hosts_lock, K_FOREVER);
+    bool changed = override[i] != MAX(value, -1);
+    override[i] = MAX(value, -1);
+    k_mutex_unlock(&hosts_lock);
+    if (changed) {
+        LOG_INF("feature %u: %s", id, value >= 0 ? "overridden" : "back to the host's");
+        atomic_set(&retries, 0);
+        k_work_submit(&apply_work);
     }
     return 0;
 }
@@ -402,7 +429,7 @@ static void apply_work_cb(struct k_work *work) {
         check_bond(host);
         LOG_DBG("pad state from host %d", host);
         for (size_t i = 0; i < TP_STATES; i++) {
-            int err = hid_touchpad_retain_feature(tp_dev, state_ids[i], hosts[host].val[i]);
+            int err = hid_touchpad_retain_feature(tp_dev, state_ids[i], pad_value(host, i));
             if (err) {
                 /* Retained anyway: written again by the retry, the next
                  * switch or the next pad power-on. */

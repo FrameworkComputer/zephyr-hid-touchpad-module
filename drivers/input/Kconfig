@@ -87,6 +87,10 @@ config HID_PASSTHROUGH_BLE_PACE_MS
       touchpad jump detection discards motion of frames that arrive
       back-to-back within one connection event).
 
+      Relative (mouse) reports aren't: the next goes just before the
+      connection event after the one that sent the last, the motion of the
+      ones that wait summed into one; a button change doesn't wait.
+
       The pace normally follows the connection interval the central
       granted, plus HID_PASSTHROUGH_BLE_PACE_MARGIN_US; this value is only
       used while no connection info is available. 0 disables pacing
