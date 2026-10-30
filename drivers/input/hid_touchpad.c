@@ -744,14 +744,46 @@ static int hid_touchpad_init(const struct device *dev) {
 
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
+/* Read and drop the reports the pad queued while the driver was suspended
+ * (DR held asserted, nobody reading). They are touches from while the board
+ * had the pad off, and forwarding one now reaches a host that has moved on:
+ * on a suspended USB bus the passthrough turns it into a remote wakeup the
+ * user never asked for. A reset signal among them is still acted on. Reads
+ * into a local buffer, since a drain that was in flight at suspend may still
+ * be dispatching from report_buf. */
+static void tp_discard_pending(const struct device *dev) {
+    struct hid_touchpad_data *data = dev->data;
+    const struct hid_touchpad_config *config = dev->config;
+    uint8_t buf[sizeof(data->report_buf)];
+
+    for (int i = 0; i < TP_DRAIN_BURST && gpio_pin_get_dt(&config->dr) > 0; i++) {
+        if (tp_lock(data)) {
+            return;
+        }
+        int err = i2c_read_dt(&config->i2c_bus, buf, data->max_input_len);
+        tp_unlock(data);
+        if (err) {
+            /* tp_arm_dr() sees DR still asserted and reads it the usual
+             * way. */
+            return;
+        }
+        if (sys_get_le16(buf) == 0 && data->num_retained > 0) {
+            LOG_INF("pad reset while suspended; writing retained features again");
+            k_work_submit(&data->reset_work);
+        }
+    }
+    LOG_DBG("dropped reports queued while suspended");
+}
+
 static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_action action) {
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
         return set_int(dev, false);
     case PM_DEVICE_ACTION_RESUME:
-        /* A report that became ready while suspended holds DR asserted, and
-         * the edge-triggered interrupt never fires for it — tp_arm_dr drains
-         * it once, same as init does. */
+        /* What the pad queued while suspended is stale: drop it. The
+         * interrupt is edge-triggered, so tp_arm_dr() still drains a report
+         * that went ready between the two. */
+        tp_discard_pending(dev);
         return tp_arm_dr(dev);
     default:
         return -ENOTSUP;
