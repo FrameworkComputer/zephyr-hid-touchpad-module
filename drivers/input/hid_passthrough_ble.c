@@ -17,20 +17,15 @@
 #include <zmk/endpoints.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/ble_active_profile_changed.h>
+#include <zmk/events/endpoint_changed.h>
 
 #include "hid_touchpad.h"
 #include "hid_passthrough_ble.h"
 #include "hid_passthrough_hosts.h"
+#include "hid_passthrough_lift.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_ble, CONFIG_HID_PASSTHROUGH_BLE_LOG_LEVEL);
-
-#define TP_NODE DT_NODELABEL(touchpad)
-
-#define TP_MOUSE_INPUT_REPORT_ID  DT_PROP(TP_NODE, mouse_input_report_id)
-#define TP_PTP_INPUT_REPORT_ID    DT_PROP(TP_NODE, ptp_input_report_id)
-#define TP_MOUSE_INPUT_REPORT_SIZE DT_PROP(TP_NODE, mouse_input_report_size)
-#define TP_PTP_INPUT_REPORT_SIZE  DT_PROP(TP_NODE, ptp_input_report_size)
 
 /* The Report Map and the feature reports BLE serves: ble-report-descriptor
  * and ble-feature-report-ids when the board sets them, else the same as
@@ -421,19 +416,7 @@ static k_ticks_t tp_mouse_next_ticks;
 /* Current pace in ticks (0 = every frame goes out immediately); read and
  * written under tp_pending_lock. */
 static k_ticks_t tp_pace_ticks;
-/* PTP payload layout (report-descriptor order): TP_PTP_MAX_CONTACTS finger
- * records of (status byte + x u16 + y u16), then contact count (1), buttons
- * (1), scan time (2). Everything derives from ptp-input-report-size so a
- * pad with a different per-contact record still lands on the right bytes;
- * the contact count is fixed at 5 like the descriptor's. */
-#define TP_PTP_MAX_CONTACTS 5
-#define TP_PTP_TRAILER_LEN  4 /* count + buttons + scan time */
-#define TP_PTP_FINGERS_LEN  (TP_PTP_INPUT_REPORT_SIZE - TP_PTP_TRAILER_LEN)
-#define TP_PTP_STRIDE       (TP_PTP_FINGERS_LEN / TP_PTP_MAX_CONTACTS)
-#define TP_PTP_COUNT_OFF    TP_PTP_FINGERS_LEN
-#define TP_PTP_BTN_OFF      (TP_PTP_FINGERS_LEN + 1)
-BUILD_ASSERT(TP_PTP_FINGERS_LEN > 0 && TP_PTP_FINGERS_LEN % TP_PTP_MAX_CONTACTS == 0,
-             "ptp-input-report-size doesn't fit 5 equal contact records + 4 trailer bytes");
+/* PTP payload layout: see hid_passthrough_lift.h. */
 #define TP_PTP_STATE_LEN    (TP_PTP_MAX_CONTACTS + 2) /* status bytes + count + buttons */
 
 /* Finger status bytes (confidence/tip/contact-id), contact count and
@@ -503,11 +486,16 @@ static void tp_conn_connected(struct bt_conn *conn, uint8_t err) {
     }
 }
 
+static void send_tp_report_callback(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(tp_send_work, send_tp_report_callback);
+
 static void tp_conn_disconnected(struct bt_conn *conn, uint8_t reason) {
     atomic_set(&tp_in_flight[bt_conn_index(conn)], 0);
     if (tp_conn_is_active_profile(conn)) {
         tp_pace_refresh(NULL);
     }
+    /* If it is tp_down_conn, the sender lets go of its reference. */
+    k_work_reschedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);
 }
 
 static void tp_conn_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
@@ -524,8 +512,14 @@ BT_CONN_CB_DEFINE(tp_conn_callbacks) = {
 };
 
 /* A profile switch changes which connection's interval matters without any
- * connection-parameter event firing. */
+ * connection-parameter event firing. An endpoint change can leave the host
+ * the reports went to with a contact down: the sender lifts it. */
 static int tp_profile_changed_listener(const zmk_event_t *eh) {
+    if (as_zmk_endpoint_changed(eh) != NULL) {
+        k_work_reschedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
     struct bt_conn *conn = NULL;
     if (zmk_ble_active_profile_is_connected()) {
         conn = zmk_ble_active_profile_conn();
@@ -539,6 +533,7 @@ static int tp_profile_changed_listener(const zmk_event_t *eh) {
 
 ZMK_LISTENER(hid_passthrough_ble, tp_profile_changed_listener);
 ZMK_SUBSCRIPTION(hid_passthrough_ble, zmk_ble_active_profile_changed);
+ZMK_SUBSCRIPTION(hid_passthrough_ble, zmk_endpoint_changed);
 
 /* Add a mouse report to the queue. Caller holds tp_pending_lock. */
 static void tp_mouse_add(const uint8_t *data, uint16_t len) {
@@ -696,9 +691,6 @@ static void tp_unheld(void) {
     tp_held_warned = false;
 }
 
-static void send_tp_report_callback(struct k_work *work);
-static K_WORK_DELAYABLE_DEFINE(tp_send_work, send_tp_report_callback);
-
 static void tp_notify_sent(struct bt_conn *conn, void *user_data) {
     atomic_t *n = &tp_in_flight[bt_conn_index(conn)];
 
@@ -723,7 +715,7 @@ static void tp_notify_sent(struct bt_conn *conn, void *user_data) {
 /* Notify the selected profile's central (conn), mirroring ZMK's keyboard
  * HOG (zmk_ble_active_profile_conn). Fanning out to every connected LE
  * central would mirror the pad to all bonded hosts at once. */
-static void tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
+static int tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
     const struct bt_gatt_attr *attr;
     if (msg->report_id == TP_MOUSE_INPUT_REPORT_ID) {
         attr = &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX];
@@ -734,7 +726,7 @@ static void tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
         memcpy(cached_ptp_report, msg->data,
                MIN(msg->len, sizeof(cached_ptp_report)));
     } else {
-        return;
+        return -EINVAL;
     }
 
     struct bt_gatt_notify_params notify_params = {
@@ -769,6 +761,77 @@ static void tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
         notify_failing = false;
         LOG_INF("Notifications flowing again");
     }
+    return err;
+}
+
+/* The link the last reports went to, referenced while the last mouse report
+ * or PTP frame it got holds a button or contact down, else NULL. A host
+ * keeps that state until its next report, so when the reports go elsewhere
+ * (a profile or endpoint switch) it gets a lift (tp_lift_left). Only held
+ * for a link that is up: a disconnect brings the sender back to drop it.
+ * TP HOG queue only. */
+static struct bt_conn *tp_down_conn;
+static bool tp_down_mouse;
+static bool tp_down_ptp;
+
+/* Record what the host on `conn` holds after `msg`. Caller has lifted any
+ * other link (tp_lift_left), so tp_down_conn is NULL or `conn`. */
+static void tp_note_sent(struct bt_conn *conn, const struct tp_report_msg *msg) {
+    bool down = tp_report_down(msg->report_id, msg->data, msg->len);
+
+    if (msg->report_id == TP_MOUSE_INPUT_REPORT_ID) {
+        tp_down_mouse = down;
+    } else {
+        tp_down_ptp = down;
+    }
+    if ((tp_down_mouse || tp_down_ptp) && tp_down_conn == NULL) {
+        tp_down_conn = bt_conn_ref(conn);
+    } else if (!tp_down_mouse && !tp_down_ptp && tp_down_conn != NULL) {
+        bt_conn_unref(tp_down_conn);
+        tp_down_conn = NULL;
+    }
+}
+
+/* Let go of what the host on tp_down_conn holds unless the reports still go
+ * there (`dest`). The last reports it got are the cached ones, since
+ * nothing goes to another link before this. Past the in-flight quota: it's
+ * one report, and the host would otherwise keep dragging. */
+static void tp_lift_left(struct bt_conn *dest) {
+    if (tp_down_conn == NULL || tp_down_conn == dest) {
+        return;
+    }
+
+    struct bt_conn_info info;
+    if (bt_conn_get_info(tp_down_conn, &info) == 0 && info.state == BT_CONN_STATE_CONNECTED) {
+        struct tp_report_msg msg;
+
+        if (tp_down_mouse) {
+            msg.report_id = TP_MOUSE_INPUT_REPORT_ID;
+            msg.len = sizeof(cached_mouse_report);
+            memcpy(msg.data, cached_mouse_report, msg.len);
+            tp_report_lift(msg.report_id, msg.data, msg.len);
+            tp_notify(tp_down_conn, &msg);
+        }
+        if (tp_down_ptp) {
+            msg.report_id = TP_PTP_INPUT_REPORT_ID;
+            msg.len = sizeof(cached_ptp_report);
+            memcpy(msg.data, cached_ptp_report, msg.len);
+            tp_report_lift(msg.report_id, msg.data, msg.len);
+            tp_notify(tp_down_conn, &msg);
+        }
+        LOG_INF("Touchpad lifted on the link it left");
+    }
+    bt_conn_unref(tp_down_conn);
+    tp_down_conn = NULL;
+    tp_down_mouse = false;
+    tp_down_ptp = false;
+
+    /* The next host has nothing down from us: a contact or button there is
+     * a change, so it doesn't wait for the pace. */
+    k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
+    memset(tp_sent_state, 0, sizeof(tp_sent_state));
+    tp_mouse_sent_buttons = 0;
+    k_spin_unlock(&tp_pending_lock, key);
 }
 
 /* Send the next pending report -- mouse, else PTP -- when the link is
@@ -776,7 +839,12 @@ static void tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
  * quota, and come back for the rest. */
 static void send_tp_report_callback(struct k_work *work) {
     struct tp_report_msg msg;
-    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    struct bt_conn *conn = NULL;
+
+    if (zmk_endpoint_get_selected().transport == ZMK_TRANSPORT_BLE) {
+        conn = zmk_ble_active_profile_conn();
+    }
+    tp_lift_left(conn);
 
     k_spinlock_key_t key = k_spin_lock(&tp_pending_lock);
     if (conn == NULL) {
@@ -837,7 +905,9 @@ static void send_tp_report_callback(struct k_work *work) {
     k_spin_unlock(&tp_pending_lock, key);
 
     tp_unheld();
-    tp_notify(conn, &msg);
+    if (tp_notify(conn, &msg) == 0) {
+        tp_note_sent(conn, &msg);
+    }
     bt_conn_unref(conn);
     if (more) {
         k_work_schedule_for_queue(&tp_hog_work_q, &tp_send_work, K_NO_WAIT);

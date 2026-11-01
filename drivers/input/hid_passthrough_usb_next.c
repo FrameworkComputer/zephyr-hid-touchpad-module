@@ -14,10 +14,13 @@
 #include <zephyr/drivers/usb/usb_buf.h>
 
 #include <zmk/endpoints.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/endpoint_changed.h>
 #include <zmk/usb.h>
 
 #include "hid_touchpad.h"
 #include "hid_passthrough_hosts.h"
+#include "hid_passthrough_lift.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(hid_passthrough_usb, CONFIG_HID_PASSTHROUGH_USB_LOG_LEVEL);
@@ -31,10 +34,22 @@ static const struct device *const hid_dev = DEVICE_DT_GET(TP_HID_NODE);
 static const struct device *tp_dev;
 static bool hid_ready;
 
+/* The last mouse report and PTP frame the host got hold a button or contact
+ * down, and that frame: the host keeps that state until its next report, so
+ * when the reports go elsewhere (endpoint switch) it gets a lift
+ * (tp_lift_work). Written where the input callbacks run (the touchpad work
+ * queue, bar a test's injected input), and cleared by iface_ready_cb for a
+ * host that let go of the interface. */
+static bool tp_down_mouse;
+static bool tp_down_ptp;
+static uint8_t tp_last_ptp[TP_PTP_INPUT_REPORT_SIZE];
+
 static void iface_ready_cb(const struct device *dev, const bool ready) {
     LOG_INF("TP HID interface %s", ready ? "ready" : "not ready");
     hid_ready = ready;
     if (!ready) {
+        tp_down_mouse = false;
+        tp_down_ptp = false;
         /* Bus reset, deconfigured or VBUS gone, each seen here even when a
          * new configuration follows before ZMK's state event runs. */
         tp_hosts_usb_reset();
@@ -151,6 +166,80 @@ static const struct hid_device_ops ops = {
     .input_report_done = input_report_done_cb,
 };
 
+/* Hand one input report to the USB stack. */
+static int tp_submit(uint8_t report_id, const uint8_t *data, uint16_t len) {
+    /* hid_device_submit_report() expects the report ID as the first byte. */
+    if ((size_t)len + 1 > sizeof(tp_tx_buf)) {
+        LOG_WRN("input report too large: %u", len);
+        return -EMSGSIZE;
+    }
+    if (k_sem_take(&tp_tx_free, TP_TX_TIMEOUT) != 0) {
+        LOG_WRN("TX buffer still in flight, dropping frame");
+        return -EBUSY;
+    }
+    tp_tx_buf[0] = report_id;
+    memcpy(&tp_tx_buf[1], data, len);
+
+    int err = hid_device_submit_report(hid_dev, len + 1, tp_tx_buf);
+    if (err) {
+        /* Not enqueued; the done callback will never fire for it. */
+        k_sem_give(&tp_tx_free);
+        LOG_WRN("submit_report failed: %d", err);
+        return err;
+    }
+
+    bool down = tp_report_down(report_id, data, len);
+    if (report_id == TP_MOUSE_INPUT_REPORT_ID) {
+        tp_down_mouse = down;
+    } else if (report_id == TP_PTP_INPUT_REPORT_ID) {
+        tp_down_ptp = down;
+        memcpy(tp_last_ptp, data, MIN(len, sizeof(tp_last_ptp)));
+    }
+    return 0;
+}
+
+/* Let go of what the host holds once USB isn't the endpoint any more. On
+ * the touchpad work queue, after any report tp_input_cb took before the
+ * switch. A suspended host gets nothing: it can't take the report. */
+static void tp_lift_work_cb(struct k_work *work) {
+    if (!tp_down_mouse && !tp_down_ptp) {
+        return;
+    }
+    if (zmk_endpoint_get_selected().transport == ZMK_TRANSPORT_USB) {
+        return;
+    }
+    if (hid_ready && !zmk_usb_is_suspended()) {
+        if (tp_down_mouse) {
+            uint8_t up[TP_MOUSE_INPUT_REPORT_SIZE];
+
+            tp_report_lift(TP_MOUSE_INPUT_REPORT_ID, up, sizeof(up));
+            tp_submit(TP_MOUSE_INPUT_REPORT_ID, up, sizeof(up));
+        }
+        if (tp_down_ptp) {
+            uint8_t up[TP_PTP_INPUT_REPORT_SIZE];
+
+            memcpy(up, tp_last_ptp, sizeof(up));
+            tp_report_lift(TP_PTP_INPUT_REPORT_ID, up, sizeof(up));
+            tp_submit(TP_PTP_INPUT_REPORT_ID, up, sizeof(up));
+        }
+        LOG_INF("Touchpad lifted on USB");
+    }
+    tp_down_mouse = false;
+    tp_down_ptp = false;
+}
+
+static K_WORK_DEFINE(tp_lift_work, tp_lift_work_cb);
+
+static int tp_endpoint_listener(const zmk_event_t *eh) {
+    if (tp_dev != NULL) {
+        k_work_submit_to_queue(hid_touchpad_work_queue(), &tp_lift_work);
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(hid_passthrough_usb, tp_endpoint_listener);
+ZMK_SUBSCRIPTION(hid_passthrough_usb, zmk_endpoint_changed);
+
 static void tp_input_cb(const struct device *dev, uint8_t report_id,
                         const uint8_t *data, uint16_t len) {
     if (!hid_ready) {
@@ -172,24 +261,7 @@ static void tp_input_cb(const struct device *dev, uint8_t report_id,
         return;
     }
 
-    /* hid_device_submit_report() expects the report ID as the first byte. */
-    if ((size_t)len + 1 > sizeof(tp_tx_buf)) {
-        LOG_WRN("input report too large: %u", len);
-        return;
-    }
-    if (k_sem_take(&tp_tx_free, TP_TX_TIMEOUT) != 0) {
-        LOG_WRN("TX buffer still in flight, dropping frame");
-        return;
-    }
-    tp_tx_buf[0] = report_id;
-    memcpy(&tp_tx_buf[1], data, len);
-
-    int err = hid_device_submit_report(hid_dev, len + 1, tp_tx_buf);
-    if (err) {
-        /* Not enqueued; the done callback will never fire for it. */
-        k_sem_give(&tp_tx_free);
-        LOG_WRN("submit_report failed: %d", err);
-    }
+    tp_submit(report_id, data, len);
 }
 
 static int hid_passthrough_usb_init(void) {
