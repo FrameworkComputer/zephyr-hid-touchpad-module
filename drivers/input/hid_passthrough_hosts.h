@@ -55,6 +55,22 @@ int tp_hosts_get_feature(int host, uint8_t id, uint8_t *buf, uint16_t buf_len,
 int tp_hosts_override(uint8_t id, int value);
 
 /**
+ * The selected host's own copy of host-state report `id`, whatever
+ * tp_hosts_override() puts on the pad: e.g. whether the host in use has a
+ * PTP driver that set Input Mode.
+ * @return the value; -ENOENT if `id` is not a host-state report, -ENODEV
+ * while no host is selected, -EBUSY while a test tool holds the pad.
+ */
+int tp_hosts_selected_value(uint8_t id);
+
+/**
+ * Have `cb` called whenever tp_hosts_selected_value() may have changed: a
+ * host's SET, a switch, a bond change, a USB reset, a hold. One callback, on
+ * the system work queue.
+ */
+void tp_hosts_set_change_cb(void (*cb)(void));
+
+/**
  * Hand the pad to a test tool that sets its modes itself (`hold` true):
  * every host's feature GETs and SETs go straight to the pad, and no host's
  * copy is written to it. Releasing writes the selected host's copy again.
@@ -83,6 +99,10 @@ static inline int tp_hosts_get_feature(int host, uint8_t id, uint8_t *buf, uint1
 }
 
 static inline int tp_hosts_override(uint8_t id, int value) { return -ENOENT; }
+
+static inline int tp_hosts_selected_value(uint8_t id) { return -ENOENT; }
+
+static inline void tp_hosts_set_change_cb(void (*cb)(void)) {}
 
 static inline void tp_hosts_hold(bool hold) {}
 

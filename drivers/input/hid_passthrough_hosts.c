@@ -166,6 +166,17 @@ static void retry_later(void) {
     }
 }
 
+/* tp_hosts_set_change_cb()'s callback, run from notify_work. */
+static void (*change_cb)(void);
+
+static void notify_work_cb(struct k_work *work) {
+    void (*cb)(void) = change_cb;
+    if (cb != NULL) {
+        cb();
+    }
+}
+static K_WORK_DEFINE(notify_work, notify_work_cb);
+
 static void set_defaults(int host) { memcpy(hosts[host].val, state_defaults, TP_STATES); }
 
 #if IS_ENABLED(CONFIG_SETTINGS) && IS_ENABLED(CONFIG_HID_PASSTHROUGH_BLE)
@@ -344,6 +355,7 @@ int tp_hosts_set_feature(int host, uint8_t id, const uint8_t *data, uint16_t len
         LOG_DBG("host %d: feature %u = 0x%02x", host, id, data[0]);
         hosts[host].val[i] = data[0];
         schedule_save(host);
+        k_work_submit(&notify_work);
     }
     int err = 0;
     if (host == selected_host()) {
@@ -385,6 +397,7 @@ void tp_hosts_hold(bool hold) {
     held = hold;
     int err = hid_touchpad_hold_retained(tp_dev, hold);
     k_mutex_unlock(&hosts_lock);
+    k_work_submit(&notify_work);
     LOG_INF("host state %s", hold ? "held: hosts write the pad directly" : "resumed");
     if (err) {
         LOG_WRN("writing host state on resume failed: %d", err);
@@ -444,6 +457,26 @@ static void apply_work_cb(struct k_work *work) {
     } else {
         atomic_set(&retries, 0);
     }
+    /* Every switch, bond change and USB reset comes through here. */
+    k_work_submit(&notify_work);
+}
+
+int tp_hosts_selected_value(uint8_t id) {
+    int i = state_index(id);
+    if (tp_dev == NULL || i < 0) {
+        return -ENOENT;
+    }
+
+    k_mutex_lock(&hosts_lock, K_FOREVER);
+    int host = selected_host();
+    int ret = held ? -EBUSY : !host_valid(host) ? -ENODEV : hosts[host].val[i];
+    k_mutex_unlock(&hosts_lock);
+    return ret;
+}
+
+void tp_hosts_set_change_cb(void (*cb)(void)) {
+    change_cb = cb;
+    k_work_submit(&notify_work);
 }
 
 void tp_hosts_usb_reset(void) {
