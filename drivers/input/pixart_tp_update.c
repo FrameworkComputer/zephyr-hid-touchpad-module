@@ -22,7 +22,8 @@
  *
  * The same user-register access also sets the pad's report and idle frame
  * rates from devicetree (pixart_tp_apply_rates()), overriding the values
- * the firmware's parameter section loads at pad boot.
+ * the firmware's parameter section loads at pad boot, and switches the
+ * pad's HID suspend (pixart_tp_set_power()).
  */
 
 #include <string.h>
@@ -350,6 +351,136 @@ static int apply_rates_at_boot(void) {
 }
 
 SYS_INIT(apply_rates_at_boot, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+#endif
+
+/* --- HID suspend: SET_POWER sleep that only a button wakes ----------------- */
+
+/* pixart,hid-suspend-enable = <bank reg mask>: the user register bit that
+ * turns SET_POWER sleep from modern standby (scanning, a touch wakes the
+ * pad) into HID suspend (no scanning, ~7 uA, only a button wakes it).
+ * PCT1036 datasheet V1.1 Table 15: bank 0 0x8c bit 3, HID_SUSPEND. */
+#define HAS_HID_SUSPEND DT_NODE_HAS_PROP(TP_NODE, pixart_hid_suspend_enable)
+
+#if HAS_HID_SUSPEND
+BUILD_ASSERT(DT_PROP_LEN(TP_NODE, pixart_hid_suspend_enable) == 3,
+             "pixart,hid-suspend-enable is <bank reg mask>");
+#define SUSPEND_BANK DT_PROP_BY_IDX(TP_NODE, pixart_hid_suspend_enable, 0)
+#define SUSPEND_REG DT_PROP_BY_IDX(TP_NODE, pixart_hid_suspend_enable, 1)
+#define SUSPEND_MASK DT_PROP_BY_IDX(TP_NODE, pixart_hid_suspend_enable, 2)
+
+/* Whether the bit may be set on the pad. Starts true: it is RAM on a pad
+ * with its own rail, so a test tool may have left it set before this boot.
+ * Only this file's writes change it; a host writing 0x43 through the
+ * passthrough goes around it. */
+static bool suspend_bit_maybe_set = true;
+
+static int suspend_bit_write_locked(const struct device *dev, bool set) {
+    uint8_t val, got;
+    int err = user_read(dev, SUSPEND_BANK, SUSPEND_REG, &val);
+    if (err) {
+        return err;
+    }
+    val = set ? (val | SUSPEND_MASK) : (val & ~SUSPEND_MASK);
+    err = user_write(dev, SUSPEND_BANK, SUSPEND_REG, val);
+    if (!err) {
+        err = user_read(dev, SUSPEND_BANK, SUSPEND_REG, &got);
+    }
+    if (err) {
+        return err;
+    }
+    if (got != val) {
+        LOG_ERR("hid suspend bit: wrote 0x%02x, pad reads back 0x%02x", val, got);
+        return -EIO;
+    }
+    suspend_bit_maybe_set = set;
+    return 0;
+}
+
+static int suspend_bit_write(const struct device *dev, bool set) {
+    int err = hid_touchpad_claim(dev, K_MSEC(100));
+    if (err) {
+        return err;
+    }
+    err = suspend_bit_write_locked(dev, set);
+    hid_touchpad_release(dev);
+    return err;
+}
+#endif /* HAS_HID_SUSPEND */
+
+int pixart_tp_set_power(const struct device *dev, enum pixart_tp_power power) {
+    int err;
+
+    switch (power) {
+    case PIXART_TP_POWER_ON:
+        /* On first: it ends the suspend, so the register access below no
+         * longer has anything to wake. */
+        err = hid_touchpad_set_power(dev, I2C_HID_PWR_ON);
+#if HAS_HID_SUSPEND
+        if (!err && suspend_bit_maybe_set) {
+            err = suspend_bit_write(dev, false);
+        }
+#endif
+        return err;
+
+    case PIXART_TP_POWER_SLEEP:
+#if HAS_HID_SUSPEND
+        if (suspend_bit_maybe_set) {
+            /* A suspended pad wakes for the access; the sleep below puts it
+             * down again, in modern standby this time. */
+            hid_touchpad_set_suspended(dev, false);
+            err = suspend_bit_write(dev, false);
+            if (err) {
+                return err;
+            }
+        }
+#endif
+        return hid_touchpad_set_power(dev, I2C_HID_PWR_SLEEP);
+
+    case PIXART_TP_POWER_SUSPEND:
+#if HAS_HID_SUSPEND
+        /* Already suspended: send sleep again anyway. A click wakes the pad
+         * half way (streaming, but still in HID sleep), and sleep alone puts
+         * it straight back into suspend (HW-verified, Daisy 0x1204). */
+        if (!hid_touchpad_is_suspended(dev)) {
+            err = suspend_bit_write(dev, true);
+            if (err) {
+                return err;
+            }
+            hid_touchpad_set_suspended(dev, true);
+        }
+        err = hid_touchpad_set_power(dev, I2C_HID_PWR_SLEEP);
+        if (err) {
+            /* Awake with the bit set: the next ON or SLEEP clears it. */
+            hid_touchpad_set_suspended(dev, false);
+        }
+        return err;
+#else
+        return -ENOTSUP;
+#endif
+
+    default:
+        return -EINVAL;
+    }
+}
+
+#if HAS_HID_SUSPEND
+/* The bit is RAM and the pad keeps it across keyboard reboots, so one left
+ * set by a test tool would make every later SET_POWER sleep click-only.
+ * APPLICATION level: after the driver's POST_KERNEL init. */
+static int clear_hid_suspend_at_boot(void) {
+    const struct device *dev = DEVICE_DT_GET(TP_NODE);
+
+    if (!device_is_ready(dev)) {
+        return 0;
+    }
+    int err = suspend_bit_write(dev, false);
+    if (err) {
+        LOG_ERR("clearing the pad's hid suspend bit failed: %d", err);
+    }
+    return 0;
+}
+
+SYS_INIT(clear_hid_suspend_at_boot, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif
 
 /* --- flash engine ---------------------------------------------------------- */
@@ -736,6 +867,13 @@ static int update_locked(const struct device *dev, const struct pixart_tp_fw_ima
             LOG_WRN("firmware updated, but applying rates failed: %d", err);
         }
     }
+#if HAS_HID_SUSPEND
+    /* And the firmware's hid suspend bit, which isn't necessarily clear. */
+    err = suspend_bit_write_locked(dev, false);
+    if (err) {
+        LOG_WRN("firmware updated, but clearing the hid suspend bit failed: %d", err);
+    }
+#endif
     /* It also put the pad back in its power-on input mode; reapply the
      * selected host's. */
     err = hid_touchpad_restore_retained(dev);

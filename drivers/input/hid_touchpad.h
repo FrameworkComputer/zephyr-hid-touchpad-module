@@ -79,6 +79,10 @@ struct hid_touchpad_data {
     uint8_t num_retained;
     /* The last SET_POWER was on, so the pad takes the retained writes. */
     bool powered;
+    /* The pad is in a click-wake-only suspend (hid_touchpad_set_suspended):
+     * any transaction but SET_POWER would wake it, so every other call
+     * fails with -EBUSY. Written under `lock`. */
+    bool suspended;
     /* hid_touchpad_hold_retained(): record retained values, write none. */
     bool retained_held;
     /* Writes the retained values again after the pad reset itself. */
@@ -180,9 +184,25 @@ int hid_touchpad_hold_retained(const struct device *dev, bool hold);
  * The device sends no response; per spec it must transition within 1 s.
  * After a successful I2C_HID_PWR_ON the retained feature reports are
  * restored (hid_touchpad_restore_retained); after I2C_HID_PWR_SLEEP they are
- * only recorded until then.
+ * only recorded until then. A successful I2C_HID_PWR_ON also clears
+ * hid_touchpad_set_suspended(). Allowed while the pad is suspended.
  */
 int hid_touchpad_set_power(const struct device *dev, uint8_t state);
+
+/**
+ * Mark the pad as being in, or out of, a suspend that only a button wakes
+ * (PixArt: HID_SUSPEND set, then SET_POWER sleep). The pad leaves such a
+ * suspend on any other I2C transaction, so while it is marked every
+ * driver call that would start one fails with -EBUSY: GET/SET_REPORT,
+ * the raw register calls and hid_touchpad_reinit_descriptor(). Only
+ * hid_touchpad_set_power() and the input-report read the pad's own DR
+ * triggers still reach the bus. A successful SET_POWER on clears the mark.
+ *
+ * Sends nothing. The caller enters and leaves the suspend itself; see
+ * pixart_tp_set_power().
+ */
+void hid_touchpad_set_suspended(const struct device *dev, bool suspended);
+bool hid_touchpad_is_suspended(const struct device *dev);
 
 /**
  * Read/write a raw (non-HID) 8-bit device register. For vendor-specific
@@ -202,9 +222,10 @@ int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val);
  *    immediately -- a host blocked on a USB control transfer must never
  *    stall behind the owner's work;
  *  - the DR interrupt is disabled and the input work item is cancelled, so
- *    the driver's own input-report reads stop too. Input resumes on release;
- *    a report that went ready meanwhile is drained then (DR is
- *    edge-triggered and would otherwise never fire again).
+ *    the driver's own input-report reads stop too. Input resumes on release
+ *    unless the device is PM-suspended (its DR interrupt was off before the
+ *    claim and stays off); a report that went ready meanwhile is drained
+ *    then (DR is edge-triggered and would otherwise never fire again).
  *
  * @param timeout How long to wait for an in-flight transaction to finish.
  * @return 0, -EALREADY if already claimed, or the k_mutex_lock error
@@ -216,7 +237,8 @@ int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val);
 int hid_touchpad_claim(const struct device *dev, k_timeout_t timeout);
 
 /**
- * Give the pad back. Re-arms the DR interrupt and drains a pending report.
+ * Give the pad back. Re-arms the DR interrupt and drains a pending report,
+ * unless the device is PM-suspended.
  * @return 0, or -EPERM when the caller does not hold the claim.
  */
 int hid_touchpad_release(const struct device *dev);
