@@ -306,7 +306,16 @@ static bool host_valid(int host) { return host >= 0 && host < TP_HOSTS; }
 
 int tp_hosts_from_conn(struct bt_conn *conn) {
 #if IS_ENABLED(CONFIG_HID_PASSTHROUGH_BLE)
+    /* With per-profile identities one host can be bonded on two profiles
+     * (dual boot, or a re-pair on another profile), as two devices under two
+     * of our addresses. Its peer address alone then names the lowest of
+     * them, so its reports would land in that profile's copy instead of the
+     * one it is connected to; match the identity the link came in on too. */
+#if IS_ENABLED(CONFIG_ZMK_BLE_NEW_IDENTITY_ON_CLEAR)
+    int profile = zmk_ble_conn_profile_index(conn);
+#else
     int profile = zmk_ble_profile_index(bt_conn_get_dst(conn));
+#endif
     if (profile < 0) {
         profile = zmk_ble_active_profile_index();
     }

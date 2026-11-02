@@ -423,9 +423,15 @@ static void tp_pace_refresh(struct bt_conn *conn) {
 }
 
 /* The conn callbacks fire for every connection; only the active profile's
- * one sets the pace (same peer-address match ZMK uses to find it). */
+ * one sets the pace (the same match ZMK uses to find it: with per-profile
+ * identities a host bonded on two profiles has a link per profile, from the
+ * same peer address). */
 static bool tp_conn_is_active_profile(struct bt_conn *conn) {
+#if IS_ENABLED(CONFIG_ZMK_BLE_NEW_IDENTITY_ON_CLEAR)
+    return zmk_ble_conn_profile_index(conn) == zmk_ble_active_profile_index();
+#else
     return bt_addr_le_cmp(bt_conn_get_dst(conn), zmk_ble_active_profile_addr()) == 0;
+#endif
 }
 
 static void tp_conn_connected(struct bt_conn *conn, uint8_t err) {
