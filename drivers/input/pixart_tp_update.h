@@ -112,6 +112,33 @@ int pixart_tp_update(const struct device *dev, const struct pixart_tp_fw_image *
  */
 int pixart_tp_apply_rates(const struct device *dev);
 
+enum pixart_tp_power {
+    PIXART_TP_POWER_ON,      /* SET_POWER on: full operation */
+    PIXART_TP_POWER_SLEEP,   /* modern standby: scanning, a touch wakes it */
+    PIXART_TP_POWER_SUSPEND, /* HID suspend: not scanning, only a button wakes it */
+};
+
+/**
+ * Put the pad in a power state, switching the touchpad node's
+ * pixart,hid-suspend-enable bit to match: set for SUSPEND, clear for ON and
+ * SLEEP.
+ *
+ * SUSPEND marks the pad suspended (hid_touchpad_set_suspended()), so every
+ * driver call but SET_POWER fails with -EBUSY until the next ON or SLEEP.
+ * Calling it again while suspended sends sleep again, which also puts a
+ * pad that a click woke half way back into suspend.
+ *
+ * A button wakes a suspended pad on its own: it streams again, but stays in
+ * HID sleep (each touch start lags) until PIXART_TP_POWER_ON. The click that
+ * woke it is not reported.
+ *
+ * Leaves the DR interrupt alone; the caller decides whether reports from a
+ * woken pad are read.
+ * @return 0, -ENOTSUP for SUSPEND without pixart,hid-suspend-enable, or the
+ *         driver's error.
+ */
+int pixart_tp_set_power(const struct device *dev, enum pixart_tp_power power);
+
 #ifdef __cplusplus
 }
 #endif

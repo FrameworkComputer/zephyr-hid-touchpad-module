@@ -88,6 +88,40 @@ static int tp_lock(struct hid_touchpad_data *data) {
 
 static void tp_unlock(struct hid_touchpad_data *data) { k_mutex_unlock(&data->lock); }
 
+/* tp_lock() for every transaction a suspended pad must not see: anything
+ * but SET_POWER and the input read its own DR asks for wakes it (PixArt
+ * PCT1036, HW-verified for GET_REPORT and the 0x43 register reads). Checked
+ * again under the mutex, which is what hid_touchpad_set_suspended() holds
+ * while it flips the flag. */
+static int tp_lock_awake(struct hid_touchpad_data *data) {
+    if (data->suspended) {
+        return -EBUSY;
+    }
+    int err = tp_lock(data);
+    if (err) {
+        return err;
+    }
+    if (data->suspended) {
+        tp_unlock(data);
+        return -EBUSY;
+    }
+    return 0;
+}
+
+void hid_touchpad_set_suspended(const struct device *dev, bool suspended) {
+    struct hid_touchpad_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->suspended = suspended;
+    k_mutex_unlock(&data->lock);
+}
+
+bool hid_touchpad_is_suspended(const struct device *dev) {
+    const struct hid_touchpad_data *data = dev->data;
+
+    return data->suspended;
+}
+
 int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
                             uint8_t *buf, uint16_t buf_len, uint16_t *out_len) {
     struct hid_touchpad_data *data = dev->data;
@@ -136,7 +170,7 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
         }
     }
 
-    int err = tp_lock(data);
+    int err = tp_lock_awake(data);
     if (err) {
         return err;
     }
@@ -188,7 +222,7 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
         if (len > 0) {
             memcpy(&msg[9], report_data, len);
         }
-        int err = tp_lock(data);
+        int err = tp_lock_awake(data);
         if (err) {
             return err;
         }
@@ -218,7 +252,7 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
             memcpy(&msg[10], report_data, len);
         }
         LOG_HEXDUMP_DBG(msg, 10 + len, "set_report ext I2C write");
-        int err = tp_lock(data);
+        int err = tp_lock_awake(data);
         if (err) {
             return err;
         }
@@ -287,6 +321,8 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
      * up to its firmware; don't depend on it. */
     data->powered = state == I2C_HID_PWR_ON;
     if (data->powered) {
+        /* On is on, whatever suspend the pad was in. */
+        hid_touchpad_set_suspended(dev, false);
         tp_retained_lost_locked(data);
         int rerr = tp_write_retained_locked(dev);
         if (rerr) {
@@ -370,7 +406,7 @@ int hid_touchpad_hold_retained(const struct device *dev, bool hold) {
 int hid_touchpad_reg_read(const struct device *dev, uint8_t reg, uint8_t *val) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
-    int err = tp_lock(data);
+    int err = tp_lock_awake(data);
     if (err) {
         return err;
     }
@@ -382,7 +418,7 @@ int hid_touchpad_reg_read(const struct device *dev, uint8_t reg, uint8_t *val) {
 int hid_touchpad_reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
-    int err = tp_lock(data);
+    int err = tp_lock_awake(data);
     if (err) {
         return err;
     }
@@ -598,6 +634,14 @@ int hid_touchpad_release(const struct device *dev) {
     }
     data->claim_owner = NULL;
     LOG_DBG("released");
+#if IS_ENABLED(CONFIG_PM_DEVICE)
+    /* The DR interrupt was off before the claim (PM_DEVICE_ACTION_SUSPEND)
+     * and must stay off: PM resume arms it again. */
+    enum pm_device_state pm_state;
+    if (pm_device_state_get(dev, &pm_state) == 0 && pm_state == PM_DEVICE_STATE_SUSPENDED) {
+        return 0;
+    }
+#endif
     return tp_arm_dr(dev);
 }
 
@@ -665,7 +709,7 @@ static int tp_read_descriptor(const struct device *dev) {
 
 int hid_touchpad_reinit_descriptor(const struct device *dev) {
     struct hid_touchpad_data *data = dev->data;
-    int err = tp_lock(data);
+    int err = tp_lock_awake(data);
     if (err) {
         return err;
     }
