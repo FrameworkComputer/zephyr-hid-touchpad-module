@@ -45,6 +45,9 @@ typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report
 typedef bool (*hid_touchpad_input_filter_t)(const struct device *dev, uint8_t report_id,
                                             const uint8_t *data, uint16_t len);
 
+/* Called instead of the input callbacks for a report read while muted. */
+typedef void (*hid_touchpad_muted_cb_t)(const struct device *dev);
+
 /* USB + BLE passthroughs, plus one for the application (daisy's activity hook). */
 #define HID_TOUCHPAD_MAX_CBS 3
 
@@ -88,6 +91,9 @@ struct hid_touchpad_data {
      * any transaction but SET_POWER would wake it, so every other call
      * fails with -EBUSY. Written under `lock`. */
     bool suspended;
+    /* hid_touchpad_set_muted(): read reports, hand them to muted_cb only. */
+    bool muted;
+    hid_touchpad_muted_cb_t muted_cb;
     /* hid_touchpad_hold_retained(): record retained values, write none. */
     bool retained_held;
     /* Writes the retained values again after the pad reset itself. */
@@ -223,6 +229,17 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state);
  */
 void hid_touchpad_set_suspended(const struct device *dev, bool suspended);
 bool hid_touchpad_is_suspended(const struct device *dev);
+
+/**
+ * Mute the pad's input (`muted` true): reports the pad's DR announces are
+ * still read, so DR keeps working and a pad that woke itself is noticed,
+ * but none reaches the input callbacks (the passthroughs, the board's
+ * activity hook). Each one calls `cb` instead, if set, from the driver's
+ * work queue. For a pad that is off as far as the user is concerned but
+ * may wake itself, e.g. on a click from HID suspend.
+ * hid_touchpad_inject_input() is not muted.
+ */
+void hid_touchpad_set_muted(const struct device *dev, bool muted, hid_touchpad_muted_cb_t cb);
 
 /**
  * Read/write a raw (non-HID) 8-bit device register. For vendor-specific

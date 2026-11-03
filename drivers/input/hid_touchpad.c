@@ -122,6 +122,13 @@ bool hid_touchpad_is_suspended(const struct device *dev) {
     return data->suspended;
 }
 
+void hid_touchpad_set_muted(const struct device *dev, bool muted, hid_touchpad_muted_cb_t cb) {
+    struct hid_touchpad_data *data = dev->data;
+
+    data->muted_cb = cb;
+    data->muted = muted;
+}
+
 int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
                             uint8_t *buf, uint16_t buf_len, uint16_t *out_len) {
     struct hid_touchpad_data *data = dev->data;
@@ -552,6 +559,12 @@ static int hid_touchpad_report_data(const struct device *dev) {
     }
 #endif
 
+    if (data->muted) {
+        if (data->muted_cb) {
+            data->muted_cb(dev);
+        }
+        return 0;
+    }
     tp_dispatch_input(dev, report_id, &data->report_buf[3], data_len);
     return 0;
 }
