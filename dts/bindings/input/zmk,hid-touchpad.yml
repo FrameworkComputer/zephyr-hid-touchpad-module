@@ -131,3 +131,13 @@ properties:
       after a further REST2_DS (0x1a/0x1b) (user bank 0 REST2_FRAME_RATE,
       0x1d). Bounds how long the first touch after a long idle takes to
       register. Daisy firmware 0x1203+ ships 20, 0x1202 shipped 4.
+
+  pixart,hid-suspend-enable:
+    type: array
+    description: >
+      <bank reg mask> of the user register bit that turns SET_POWER sleep
+      into HID suspend: no scanning, only a button wakes the pad (PCT1036:
+      <0 0x8c 0x08>, HID_SUSPEND; PJP343: <0 0xb6 0x01>). With it,
+      pixart_tp_set_power() offers PIXART_TP_POWER_SUSPEND, and the bit is
+      cleared at boot and after a firmware update so a plain sleep keeps
+      waking on touch.
