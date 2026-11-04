@@ -106,7 +106,9 @@ properties:
 
   # PixArt pads only, written over vendor feature report 0x43. Each value
   # overrides the user register the firmware's parameter section loads at
-  # pad boot; leave a property out to keep the firmware's value.
+  # pad boot; leave a property out to keep the firmware's value. The
+  # register addresses are the PCT1036 (PJP360) layout: other PixArt parts
+  # differ (the PJP343 keeps its rest timeouts in seconds at 0x18/0x19).
 
   pixart,max-report-rate:
     type: int
@@ -131,6 +133,48 @@ properties:
       after a further REST2_DS (0x1a/0x1b) (user bank 0 REST2_FRAME_RATE,
       0x1d). Bounds how long the first touch after a long idle takes to
       register. Daisy firmware 0x1203+ ships 20, 0x1202 shipped 4.
+
+  pixart,rest1-timeout-ms:
+    type: int
+    description: >
+      Time without touch before the pad drops from run to the first idle
+      mode, in ms: a multiple of 50, 50-3276750 (user bank 0 REST1_DS,
+      0x18/0x19, 50 ms units). Counted from the last touch or SET_POWER on;
+      host register reads don't count as activity. Daisy firmware ships
+      10000.
+
+  pixart,rest2-timeout-ms:
+    type: int
+    description: >
+      Further time in the first idle mode before the second, in ms: a
+      multiple of 50, 50-3276750 (user bank 0 REST2_DS, 0x1a/0x1b). Daisy
+      firmware ships 10000.
+
+  pixart,sleep-report-rate:
+    type: int
+    description: >
+      Scan rate in Hz, 1-255, while the pad is in HID sleep (modern standby,
+      SET_POWER sleep without HID suspend), which bounds how long a touch
+      takes to wake it (user bank 0 HID_SLEEP_REPORT_RATE, 0x8e; datasheet
+      SLEEP_REPORT_RATE). The pad latches it when sleep starts, so a write
+      applies from the next SET_POWER sleep. Unused in HID suspend, which
+      doesn't scan. Daisy firmware ships 4.
+
+  pixart,sleep-report-latency:
+    type: int
+    description: >
+      Raw value, 0-255, of user bank 0 HID_SLEEP_REPORT_LATENCY (0x8d), an
+      HID sleep parameter. PixArt's register table names it but documents
+      neither unit nor effect; the datasheet leaves it out. Daisy firmware
+      ships 23. Set it only to pin the firmware's value.
+
+  pixart,sleep-drive-cycle:
+    type: int
+    description: >
+      Raw value, 0-255, of user bank 0 HID_SLEEP_DRIVE_CYCLE (0x8f), an HID
+      sleep parameter. PixArt's register table names it but documents
+      neither unit nor effect; the datasheet leaves it out. Daisy firmware
+      ships 15. Set it only to pin the firmware's value.
 
   pixart,hid-suspend-enable:
     type: array

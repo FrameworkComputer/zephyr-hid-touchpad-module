@@ -97,8 +97,10 @@ int pixart_tp_update(const struct device *dev, const struct pixart_tp_fw_image *
                      pixart_tp_progress_cb_t cb, void *user);
 
 /**
- * Write the touchpad node's pixart,max-report-rate / pixart,rest1-frame-rate
- * / pixart,rest2-frame-rate into the pad's user registers and read them
+ * Write the touchpad node's pixart,max-report-rate, pixart,rest1-frame-rate,
+ * pixart,rest2-frame-rate, pixart,rest1-timeout-ms, pixart,rest2-timeout-ms,
+ * pixart,sleep-report-rate, pixart,sleep-report-latency and
+ * pixart,sleep-drive-cycle into the pad's user registers and read them
  * back. CONFIG_HID_TOUCHPAD_PIXART_RATES runs this at boot and after every
  * pixart_tp_update(); a board only needs to call it after something else
  * that resets the pad (the registers are RAM, reloaded from the firmware's
@@ -108,7 +110,7 @@ int pixart_tp_update(const struct device *dev, const struct pixart_tp_fw_image *
  * someone else holds it.
  *
  * @return 0, -EIO when a register does not read back as written, or the
- *         driver's error. 0 without touching the pad when no rate is set.
+ *         driver's error. 0 without touching the pad when none is set.
  */
 int pixart_tp_apply_rates(const struct device *dev);
 

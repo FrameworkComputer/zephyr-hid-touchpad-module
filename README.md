@@ -171,20 +171,30 @@ pixart_tp_update(dev, &image, progress_cb, user);   /* seconds; claims the pad *
 
 Policy (when to flash, power gating, factory hooks) belongs to the board.
 
-## PixArt report and idle frame rates
+## PixArt report and idle frame rates, idle timeouts
 
-A PixArt pad loads its rates from the firmware's parameter section into user
-registers at pad boot. Set any of these on the touchpad node to override them
-(Hz, 1-255; leave one out to keep the firmware's value):
+A PixArt pad loads its rates and idle timeouts from the firmware's parameter
+section into user registers at pad boot. Set any of these on the touchpad
+node to override them (rates in Hz, 1-255; timeouts in ms, multiples of 50;
+the two raw HID sleep values 0-255; leave one out to keep the firmware's
+value):
 
 ```dts
 touchpad@2c {
     /* ... */
-    pixart,max-report-rate = <140>;   /* run mode (MAX_REPORT_RATE, 0x12) */
-    pixart,rest1-frame-rate = <20>;   /* first idle mode (0x1c) */
-    pixart,rest2-frame-rate = <20>;   /* deeper idle mode (0x1d) */
+    pixart,max-report-rate = <140>;     /* run mode (MAX_REPORT_RATE, 0x12) */
+    pixart,rest1-frame-rate = <20>;     /* first idle mode (0x1c) */
+    pixart,rest2-frame-rate = <20>;     /* deeper idle mode (0x1d) */
+    pixart,rest1-timeout-ms = <10000>;  /* run -> rest1 (REST1_DS, 0x18/0x19) */
+    pixart,rest2-timeout-ms = <10000>;  /* rest1 -> rest2 (REST2_DS, 0x1a/0x1b) */
+    pixart,sleep-report-rate = <4>;     /* HID sleep / modern standby (0x8e) */
+    pixart,sleep-report-latency = <23>; /* HID sleep, raw, undocumented (0x8d) */
+    pixart,sleep-drive-cycle = <15>;    /* HID sleep, raw, undocumented (0x8f) */
 };
 ```
+
+Rates and timeouts apply at once. The HID sleep rate is latched when the pad
+enters SET_POWER sleep, so it applies from the next sleep.
 
 Setting one enables `CONFIG_HID_TOUCHPAD_PIXART_RATES`, which writes them over
 vendor report 0x43 at boot and after every `pixart_tp_update()` (whose final
@@ -193,9 +203,9 @@ observed report rate (`OBS_REPORT_RATE`, 0x10). After anything else that
 resets the pad, a board calls `pixart_tp_apply_rates(dev)` itself.
 
 The Daisy firmware releases differ only in these values: 0x1202 runs
-130 / 20 / 4 Hz, 0x1203 130 / 20 / 20, 0x1204 140 / 20 / 20. The idle modes
-follow REST1_DS / REST2_DS (0x18-0x1b, 50 ms units; 10 s each in those
-releases). Idle rates come from the slow oscillator and may be off by up to
+130 / 20 / 4 Hz, 0x1203 130 / 20 / 20, 0x1204 140 / 20 / 20. The idle
+timeouts are 10 s each, the HID sleep rate 4 Hz, latency 23 and drive cycle
+15 in 0x1204. Idle rates come from the slow oscillator and may be off by up to
 50%. Register names are from PixArt's PTHIDUtility register table; no
 PixArt tool sends an "apply" command after a user-register write.
 

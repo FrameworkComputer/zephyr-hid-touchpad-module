@@ -21,9 +21,10 @@
  * write-read transaction and the pad clock-stretches as needed.
  *
  * The same user-register access also sets the pad's report and idle frame
- * rates from devicetree (pixart_tp_apply_rates()), overriding the values
- * the firmware's parameter section loads at pad boot, and switches the
- * pad's HID suspend (pixart_tp_set_power()).
+ * rates, idle timeouts and HID sleep rate from devicetree
+ * (pixart_tp_apply_rates()), overriding the values the firmware's parameter
+ * section loads at pad boot, and switches the pad's HID suspend
+ * (pixart_tp_set_power()).
  */
 
 #include <string.h>
@@ -100,8 +101,14 @@ LOG_MODULE_REGISTER(pixart_tp_update, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
  * for this part (pjp360userregistertable.xml). */
 #define REG_USER0_OBS_REPORT_RATE 0x10  /* u16 LE, read-only */
 #define REG_USER0_MAX_REPORT_RATE 0x12  /* u16 LE; firmware params set the low byte only */
+#define REG_USER0_REST1_DS 0x18         /* u16 LE, 50 ms units: run -> rest1 */
+#define REG_USER0_REST2_DS 0x1a         /* u16 LE, 50 ms units: rest1 -> rest2 */
 #define REG_USER0_REST1_FRAME_RATE 0x1c /* Hz */
 #define REG_USER0_REST2_FRAME_RATE 0x1d /* Hz */
+#define REG_USER0_HID_SLEEP_REPORT_LATENCY 0x8d /* meaning undocumented */
+#define REG_USER0_HID_SLEEP_REPORT_RATE 0x8e    /* Hz, latched at SET_POWER sleep */
+#define REG_USER0_HID_SLEEP_DRIVE_CYCLE 0x8f    /* meaning undocumented */
+#define REST_DS_UNIT_MS 50
 
 /* Quirk [PIXARTTP\PARTID_0360]: PixartTpSramSelect = 0x00. The fwupd base
  * class defaults to 0x0F; that is NOT what runs against this part. */
@@ -259,58 +266,107 @@ int pixart_tp_read_info(const struct device *dev, struct pixart_tp_info *info) {
     return err;
 }
 
-/* --- report / frame rates from devicetree ---------------------------------- */
+/* --- report / frame rates and idle timeouts from devicetree -------------- */
 
 #define TP_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(zmk_hid_touchpad)
 
-/* 0 = property absent: keep the value the firmware's parameter section set.
+/* An absent property keeps the value the firmware's parameter section set.
  * Only the low byte of MAX_REPORT_RATE is written, as the parameter section
  * does, so every rate must fit in one. */
-#define RATE_PROP(prop) DT_PROP_OR(TP_NODE, prop, 0)
-#define RATE_PROP_VALID(prop) IN_RANGE(DT_PROP_OR(TP_NODE, prop, 1), 1, 255)
-BUILD_ASSERT(RATE_PROP_VALID(pixart_max_report_rate), "pixart,max-report-rate must be 1-255 Hz");
-BUILD_ASSERT(RATE_PROP_VALID(pixart_rest1_frame_rate), "pixart,rest1-frame-rate must be 1-255 Hz");
-BUILD_ASSERT(RATE_PROP_VALID(pixart_rest2_frame_rate), "pixart,rest2-frame-rate must be 1-255 Hz");
+#define REG_PROP(prop) DT_PROP_OR(TP_NODE, prop, 0)
+#define REG_SET(prop) DT_NODE_HAS_PROP(TP_NODE, prop)
+#define HZ_PROP_VALID(prop) IN_RANGE(DT_PROP_OR(TP_NODE, prop, 1), 1, 255)
+#define MS_PROP_VALID(prop)                                                                        \
+    (DT_PROP_OR(TP_NODE, prop, REST_DS_UNIT_MS) % REST_DS_UNIT_MS == 0 &&                          \
+     IN_RANGE(DT_PROP_OR(TP_NODE, prop, REST_DS_UNIT_MS), REST_DS_UNIT_MS,                         \
+              UINT16_MAX * REST_DS_UNIT_MS))
+BUILD_ASSERT(HZ_PROP_VALID(pixart_max_report_rate), "pixart,max-report-rate must be 1-255 Hz");
+BUILD_ASSERT(HZ_PROP_VALID(pixart_rest1_frame_rate), "pixart,rest1-frame-rate must be 1-255 Hz");
+BUILD_ASSERT(HZ_PROP_VALID(pixart_rest2_frame_rate), "pixart,rest2-frame-rate must be 1-255 Hz");
+BUILD_ASSERT(HZ_PROP_VALID(pixart_sleep_report_rate), "pixart,sleep-report-rate must be 1-255 Hz");
+BUILD_ASSERT(MS_PROP_VALID(pixart_rest1_timeout_ms),
+             "pixart,rest1-timeout-ms must be a multiple of 50, 50-3276750");
+BUILD_ASSERT(MS_PROP_VALID(pixart_rest2_timeout_ms),
+             "pixart,rest2-timeout-ms must be a multiple of 50, 50-3276750");
+BUILD_ASSERT(IN_RANGE(REG_PROP(pixart_sleep_report_latency), 0, 255),
+             "pixart,sleep-report-latency must be 0-255");
+BUILD_ASSERT(IN_RANGE(REG_PROP(pixart_sleep_drive_cycle), 0, 255),
+             "pixart,sleep-drive-cycle must be 0-255");
 
 static const struct {
+    bool set;
     uint8_t reg;
-    uint8_t hz;
+    uint8_t width; /* bytes, little-endian */
+    uint16_t val;  /* in register units */
+    uint8_t unit;  /* register unit, in the logged unit */
     const char *name;
-} rates[] = {
-    {REG_USER0_MAX_REPORT_RATE, RATE_PROP(pixart_max_report_rate), "max report rate"},
-    {REG_USER0_REST1_FRAME_RATE, RATE_PROP(pixart_rest1_frame_rate), "rest1 frame rate"},
-    {REG_USER0_REST2_FRAME_RATE, RATE_PROP(pixart_rest2_frame_rate), "rest2 frame rate"},
+    const char *unit_name;
+} user_regs[] = {
+#define USER_REG(prop, reg, width, unit, name, unit_name)                                         \
+    {REG_SET(prop), reg, width, REG_PROP(prop) / (unit), unit, name, unit_name}
+    USER_REG(pixart_max_report_rate, REG_USER0_MAX_REPORT_RATE, 1, 1, "max report rate", "Hz"),
+    USER_REG(pixart_rest1_frame_rate, REG_USER0_REST1_FRAME_RATE, 1, 1, "rest1 frame rate", "Hz"),
+    USER_REG(pixart_rest2_frame_rate, REG_USER0_REST2_FRAME_RATE, 1, 1, "rest2 frame rate", "Hz"),
+    USER_REG(pixart_rest1_timeout_ms, REG_USER0_REST1_DS, 2, REST_DS_UNIT_MS, "rest1 timeout",
+             "ms"),
+    USER_REG(pixart_rest2_timeout_ms, REG_USER0_REST2_DS, 2, REST_DS_UNIT_MS, "rest2 timeout",
+             "ms"),
+    USER_REG(pixart_sleep_report_rate, REG_USER0_HID_SLEEP_REPORT_RATE, 1, 1,
+             "hid sleep report rate", "Hz"),
+    USER_REG(pixart_sleep_report_latency, REG_USER0_HID_SLEEP_REPORT_LATENCY, 1, 1,
+             "hid sleep report latency", "(raw)"),
+    USER_REG(pixart_sleep_drive_cycle, REG_USER0_HID_SLEEP_DRIVE_CYCLE, 1, 1,
+             "hid sleep drive cycle", "(raw)"),
+#undef USER_REG
 };
 
 #define ANY_RATE_SET                                                                               \
-    (RATE_PROP(pixart_max_report_rate) || RATE_PROP(pixart_rest1_frame_rate) ||                    \
-     RATE_PROP(pixart_rest2_frame_rate))
+    (REG_SET(pixart_max_report_rate) || REG_SET(pixart_rest1_frame_rate) ||                        \
+     REG_SET(pixart_rest2_frame_rate) || REG_SET(pixart_rest1_timeout_ms) ||                       \
+     REG_SET(pixart_rest2_timeout_ms) || REG_SET(pixart_sleep_report_rate) ||                      \
+     REG_SET(pixart_sleep_report_latency) || REG_SET(pixart_sleep_drive_cycle))
 
 static int apply_rates_locked(const struct device *dev) {
-    for (size_t i = 0; i < ARRAY_SIZE(rates); i++) {
-        if (!rates[i].hz) {
+    for (size_t i = 0; i < ARRAY_SIZE(user_regs); i++) {
+        uint16_t val = user_regs[i].val;
+        uint8_t reg = user_regs[i].reg;
+        uint16_t got;
+        int err;
+
+        if (!user_regs[i].set) {
             continue;
         }
-        uint8_t got;
-        int err = user_write(dev, USER_BANK0, rates[i].reg, rates[i].hz);
-        if (!err) {
-            err = user_read(dev, USER_BANK0, rates[i].reg, &got);
+        /* A 16-bit pair goes low byte first: the high byte write applies. */
+        err = user_write(dev, USER_BANK0, reg, val & 0xff);
+        if (!err && user_regs[i].width == 2) {
+            err = user_write(dev, USER_BANK0, reg + 1, val >> 8);
+        }
+        if (!err && user_regs[i].width == 2) {
+            err = read_u16(dev, REPORT_ID_USER, USER_BANK0, reg, &got);
+        } else if (!err) {
+            uint8_t b;
+
+            err = user_read(dev, USER_BANK0, reg, &b);
+            got = b;
         }
         if (err) {
             return err;
         }
-        if (got != rates[i].hz) {
-            LOG_ERR("%s: wrote %u Hz, pad reads back %u", rates[i].name, rates[i].hz, got);
+        if (got != val) {
+            LOG_ERR("%s: wrote %u %s, pad reads back %u", user_regs[i].name,
+                    (unsigned int)val * user_regs[i].unit, user_regs[i].unit_name,
+                    (unsigned int)got * user_regs[i].unit);
             return -EIO;
         }
-        LOG_INF("%s %u Hz", rates[i].name, rates[i].hz);
+        LOG_INF("%s %u %s", user_regs[i].name, (unsigned int)val * user_regs[i].unit,
+                user_regs[i].unit_name);
     }
 
-    /* The pad's own estimate of the rate it runs at (the frame rate of the
-     * rest mode while idle). A live MAX_REPORT_RATE write is honoured: on
-     * Daisy firmware 0x1204, written while in rest2, the next touch ran at
-     * the new rate. Whether a write mid-run switches at once is untested, so
-     * this may still show the old rate until the pad next enters run mode. */
+    /* The pad's own estimate of the rate it runs at: the rest mode's frame
+     * rate while idle, the HID sleep rate while asleep. Rate and timeout
+     * writes take effect at once (Daisy firmware 0x1204: a MAX_REPORT_RATE
+     * write mid-touch changes the frame period from the next frame on), but
+     * the HID sleep rate only at the next SET_POWER sleep. */
     uint16_t obs;
     if (read_u16(dev, REPORT_ID_USER, USER_BANK0, REG_USER0_OBS_REPORT_RATE, &obs) == 0) {
         LOG_INF("pad observed report rate %u Hz", obs);
