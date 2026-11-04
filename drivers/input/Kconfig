@@ -65,6 +65,23 @@ config HID_PASSTHROUGH_BLE
       Enable BLE HOGP passthrough for the touchpad as a second HID service,
       notifying the central of ZMK's active profile. Requires ZMK.
 
+DT_PROP_HOG_REPORT_DESCRIPTOR := hog-report-descriptor
+
+config HID_PASSTHROUGH_BLE_HOG_PTP
+    bool "Also offer the precision touchpad in the keyboard's HID service"
+    depends on HID_PASSTHROUGH_BLE && HID_PASSTHROUGH_HOST_STATE
+    default y if $(dt_compat_any_has_prop,$(DT_COMPAT_ZMK_HID_TOUCHPAD),$(DT_PROP_HOG_REPORT_DESCRIPTOR))
+    help
+      Android's HID-over-GATT host uses only the first HID service on a
+      device, which is the keyboard's (ZMK's hog_svc), so it never sees the
+      pad's own service. With this, the keyboard's service appends the
+      touchpad node's hog-report-descriptor to its report map and carries
+      that collection's input report and feature reports. A host that
+      subscribes to the pad's own PTP input gets the frames there as
+      before; one that subscribes only to the keyboard service's copy gets
+      them there, and its Input Mode copy is set to PTP for it, since that
+      collection has no configuration collection to set it with.
+
 config HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE
     int "BLE passthrough notify work queue stack size"
     depends on HID_PASSTHROUGH_BLE
