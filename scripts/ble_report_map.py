@@ -15,10 +15,21 @@ Every input, output and feature item that remains parses exactly as in
 report-descriptor: same global and local state, same enclosing
 collections. The script checks that, and that the result fits in 512 bytes.
 
+With --hog-collection PAGE:USAGE it also writes hog-report-descriptor and
+hog-feature-report-ids: that one top-level collection on its own, for the
+keyboard's HID service to append to its report map. Hosts that use only the
+first HID service on a device (Android) see the pad through it. Its report
+IDs are moved up by --hog-id-offset (written as hog-report-id-offset) so
+they don't clash with the keyboard's. It can't rely on globals the
+keyboard's map leaves behind, so every global its reports see is set inside
+it; the script checks that it parses the same on its own as in
+report-descriptor. The keyboard's service checks the combined size.
+
 The descriptor must have one item per line, `05 01  // comment`, as in the
 Daisy dtsi. Comments are kept.
 
-usage: ble_report_map.py FILE [--drop-page 0xff00 ...] [--check]
+usage: ble_report_map.py FILE [--drop-page 0xff00 ...]
+                         [--hog-collection 0x0d:0x05 --hog-id-offset 0x10] [--check]
 """
 
 import argparse
@@ -30,11 +41,13 @@ MAX_ATTRIBUTE_LEN = 512
 MAIN, GLOBAL, LOCAL = 0, 1, 2
 INPUT, OUTPUT, COLLECTION, FEATURE, END_COLLECTION = 8, 9, 10, 11, 12
 USAGE_PAGE, REPORT_ID, PUSH, POP = 0, 8, 10, 11
+USAGE = 0
 SIGNED = {1, 2, 3, 4}  # logical/physical minimum/maximum
 
 USB_PROP = re.compile(r"(?<![\w-])report-descriptor\s*=\s*\[(.*?)\];", re.S)
 BLE_PROP = re.compile(r"ble-report-descriptor\s*=\s*\[.*?\];", re.S)
 BLE_FEATURES = re.compile(r"ble-feature-report-ids\s*=\s*<[^>]*>;")
+HOG_BLOCK = re.compile(r"\n\n/\* Keyboard-service copy.*?hog-report-descriptor\s*=\s*\[.*?\];", re.S)
 
 
 def fail(msg):
@@ -111,25 +124,38 @@ def reports(items):
     return out
 
 
-def ble_items(items, drop_pages):
-    # Top-level collections to leave out, with the items that lead up to them
-    keep, pending, depth, page = [], [], 0, None
+def top_level(items):
+    """[(usage page, usage, items)] per top-level collection, each with the
+    items that lead up to it; whatever follows the last one gets (None, None)."""
+    groups, pending, depth, page, usage = [], [], 0, None, None
     for it in items:
         if it.type == GLOBAL and it.tag == USAGE_PAGE:
             page = it.value
+        if it.type == LOCAL and it.tag == USAGE and depth == 0:
+            usage = it.value
         pending.append(it)
         if it.type == MAIN and it.tag == COLLECTION:
             if depth == 0:
-                top_page = page
+                top = (page, usage)
             depth += 1
         elif it.type == MAIN and it.tag == END_COLLECTION:
             depth -= 1
             if depth == 0:
-                if top_page not in drop_pages:
-                    keep += pending
-                pending = []
-    keep += pending
+                groups.append((*top, pending))
+                pending, usage = [], None
+    if pending:
+        groups.append((None, None, pending))
+    return groups
 
+
+def ble_items(items, drop_pages):
+    # Top-level collections to leave out, with the items that lead up to them
+    keep = [it for page, _, group in top_level(items) if page is None or page not in drop_pages
+            for it in group]
+    return minimize(keep)
+
+
+def minimize(keep):
     # Drop globals that change nothing, and shorten the rest
     out, glob, stack = [], {}, []
     for it in keep:
@@ -144,6 +170,54 @@ def ble_items(items, drop_pages):
             it = Item(encode(it, it.value), it.line)
         out.append(it)
     return out
+
+
+def hog_items(items, page, usage, offset):
+    """The top-level collection page:usage on its own, its report IDs moved
+    up by offset, setting every global its reports see."""
+    glob, stack = {}, []
+    for gpage, gusage, group in top_level(items):
+        if (gpage, gusage) == (page, usage):
+            break
+        for it in group:
+            if it.type == GLOBAL and it.tag == PUSH:
+                stack.append(dict(glob))
+            elif it.type == GLOBAL and it.tag == POP:
+                glob = stack.pop()
+            elif it.type == GLOBAL:
+                glob[it.tag] = (it.value, it)
+    else:
+        fail(f"no top-level collection {page:#x}:{usage:#x} in report-descriptor")
+
+    # Globals in effect before the collection that its reports still see
+    carried, set_inside = {}, set()
+    for it in group:
+        if it.type == GLOBAL and it.tag in (PUSH, POP):
+            fail("Push/Pop in the --hog-collection isn't supported")
+        if it.type == GLOBAL:
+            set_inside.add(it.tag)
+        elif it.is_data():
+            for tag, (value, src) in glob.items():
+                if tag not in set_inside and tag != REPORT_ID:
+                    carried[tag] = (value, src)
+    indent = group[0].line[:len(group[0].line) - len(group[0].line.lstrip())]
+    lead = []
+    for tag, (value, src) in sorted(carried.items()):
+        raw = encode(src, value)
+        comment = src.line.partition("//")[2].strip()
+        lead.append(Item(raw, f"{indent}{raw.hex(' ').upper():<15}// {comment} (carried over)"))
+
+    out = []
+    for it in lead + group:
+        if it.type == GLOBAL and it.tag == REPORT_ID:
+            new = it.value + offset
+            if not 0 < new < 256:
+                fail(f"report {it.value} + {offset:#x} isn't a report ID")
+            raw = bytes([it.raw[0]]) + new.to_bytes(len(it.raw) - 1, "little")
+            code, sep, comment = it.line.partition("//")
+            it = Item(raw, f"{code}{sep}{re.sub(r'0x[0-9A-Fa-f]+', f'{new:#04x}', comment, count=1)}")
+        out.append(it)
+    return minimize(out)
 
 
 def render(items):
@@ -161,6 +235,11 @@ def main():
     ap.add_argument("file")
     ap.add_argument("--drop-page", type=lambda s: int(s, 0), action="append", default=[],
                     help="usage page of a top-level collection to leave out (repeatable)")
+    ap.add_argument("--hog-collection", type=lambda s: tuple(int(x, 0) for x in s.split(":")),
+                    help="PAGE:USAGE of a top-level collection to also write on its own as "
+                         "hog-report-descriptor")
+    ap.add_argument("--hog-id-offset", type=lambda s: int(s, 0), default=0x10,
+                    help="added to the report IDs of hog-report-descriptor (default 0x10)")
     ap.add_argument("--check", action="store_true", help="fail if FILE is out of date")
     args = ap.parse_args()
 
@@ -205,16 +284,50 @@ def main():
 {features}
 {descriptor}""" + new[m.end():]
 
+    hog_note = ""
+    if args.hog_collection:
+        page, usage = args.hog_collection
+        hog = hog_items(usb, page, usage, args.hog_id_offset)
+        hog_reports = reports(hog)
+        for (kind, rid), seen in hog_reports.items():
+            if usb_reports.get((kind, rid - args.hog_id_offset)) != seen:
+                fail(f"hog report {rid:#x} doesn't parse the same as report "
+                     f"{rid - args.hog_id_offset} in report-descriptor")
+        hog_features = {rid - args.hog_id_offset for kind, rid in hog_reports if kind == FEATURE}
+        hog_ids = [i for i in m_ids.group(1).split() if int(i, 0) in hog_features]
+        hog_size = sum(len(it.raw) for it in hog)
+        block = f"""
+
+/* Keyboard-service copy of the {page:#04x}:{usage:#04x} collection, {hog_size} bytes, for hosts
+ * that use only a device's first HID service (Android): the keyboard's HID
+ * service appends it to its own report map. Report IDs are those of
+ * report-descriptor plus hog-report-id-offset; hog-feature-report-ids are
+ * the pad's IDs. Every global its reports see is set inside it.
+ * Written by zephyr-hid-touchpad-module/scripts/ble_report_map.py
+ * --hog-collection {page:#04x}:{usage:#04x} --hog-id-offset {args.hog_id_offset:#04x}. */
+hog-report-id-offset = <{args.hog_id_offset:#04x}>;
+hog-feature-report-ids = <{' '.join(hog_ids)}>;
+hog-report-descriptor = [
+{render(hog)}
+];"""
+        if HOG_BLOCK.search(new):
+            new = HOG_BLOCK.sub(lambda _: block, new)
+        else:
+            end = BLE_PROP.search(new)
+            end = end.end() if end else m.end()
+            new = new[:end] + block + new[end:]
+        hog_note = f", keyboard-service copy {hog_size} bytes, features {' '.join(hog_ids)}"
+
     if args.check:
         if new != text:
             sys.stdout.writelines(difflib.unified_diff(
                 text.splitlines(True), new.splitlines(True), args.file, "regenerated"))
             fail(f"{args.file} is out of date; rerun without --check")
-        print(f"{args.file}: BLE report map up to date ({size} bytes)")
+        print(f"{args.file}: BLE report map up to date ({size} bytes{hog_note})")
         return
     open(args.file, "w").write(new)
     print(f"{args.file}: BLE report map {size} bytes (report-descriptor "
-          f"{sum(len(it.raw) for it in usb)}), features {' '.join(ids)}")
+          f"{sum(len(it.raw) for it in usb)}), features {' '.join(ids)}{hog_note}")
 
 
 if __name__ == "__main__":

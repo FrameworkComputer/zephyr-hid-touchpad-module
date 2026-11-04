@@ -104,6 +104,38 @@ properties:
       must also be in feature-report-ids. Set it when ble-report-descriptor
       leaves some out.
 
+  hog-report-descriptor:
+    type: uint8-array
+    description: >
+      One top-level collection (the precision touchpad) for the keyboard's
+      own HID service to append to its report map, for hosts that use only
+      the first HID service on a device: Android never sees the pad's own
+      service. Report IDs are report-descriptor's plus hog-report-id-offset,
+      and it must not rely on globals set before it. scripts/ble_report_map.py
+      --hog-collection writes and checks it. With it, the keyboard's HID
+      service also gets that collection's input report and the features in
+      hog-feature-report-ids (CONFIG_HID_PASSTHROUGH_BLE_HOG_PTP).
+
+  hog-feature-report-ids:
+    type: array
+    description: >
+      The pad's IDs of the feature reports in hog-report-descriptor. Each
+      must also be in feature-report-ids.
+
+  hog-report-id-offset:
+    type: int
+    description: >
+      Added to the pad's report IDs in hog-report-descriptor, so they don't
+      clash with the keyboard's.
+
+  input-mode-report-id:
+    type: int
+    description: >
+      The PTP Input Mode feature report (0 = mouse, 3 = PTP). A host that
+      uses only the keyboard's HID service can't set it, since the
+      configuration collection isn't in hog-report-descriptor; the keyboard
+      sets PTP mode for it.
+
   # PixArt pads only, written over vendor feature report 0x43. Each value
   # overrides the user register the firmware's parameter section loads at
   # pad boot; leave a property out to keep the firmware's value. The
