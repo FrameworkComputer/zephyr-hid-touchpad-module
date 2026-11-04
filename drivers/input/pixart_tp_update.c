@@ -275,15 +275,22 @@ int pixart_tp_read_info(const struct device *dev, struct pixart_tp_info *info) {
  * does, so every rate must fit in one. */
 #define REG_PROP(prop) DT_PROP_OR(TP_NODE, prop, 0)
 #define REG_SET(prop) DT_NODE_HAS_PROP(TP_NODE, prop)
-#define HZ_PROP_VALID(prop) IN_RANGE(DT_PROP_OR(TP_NODE, prop, 1), 1, 255)
+#define HZ_PROP_VALID(prop, min) IN_RANGE(DT_PROP_OR(TP_NODE, prop, min), min, 255)
 #define MS_PROP_VALID(prop)                                                                        \
     (DT_PROP_OR(TP_NODE, prop, REST_DS_UNIT_MS) % REST_DS_UNIT_MS == 0 &&                          \
      IN_RANGE(DT_PROP_OR(TP_NODE, prop, REST_DS_UNIT_MS), REST_DS_UNIT_MS,                         \
               UINT16_MAX * REST_DS_UNIT_MS))
-BUILD_ASSERT(HZ_PROP_VALID(pixart_max_report_rate), "pixart,max-report-rate must be 1-255 Hz");
-BUILD_ASSERT(HZ_PROP_VALID(pixart_rest1_frame_rate), "pixart,rest1-frame-rate must be 1-255 Hz");
-BUILD_ASSERT(HZ_PROP_VALID(pixart_rest2_frame_rate), "pixart,rest2-frame-rate must be 1-255 Hz");
-BUILD_ASSERT(HZ_PROP_VALID(pixart_sleep_report_rate), "pixart,sleep-report-rate must be 1-255 Hz");
+/* 1 Hz hangs the pad as a rest frame rate and as the HID sleep rate (Daisy
+ * firmware 0x1204, PPK2 on the pad rail): about a second after entering that
+ * mode it draws a flat 8-9.5 mA and stops scanning until a power cycle.
+ * 2 Hz works. The run rate was not tried at 1 Hz. */
+BUILD_ASSERT(HZ_PROP_VALID(pixart_max_report_rate, 1), "pixart,max-report-rate must be 1-255 Hz");
+BUILD_ASSERT(HZ_PROP_VALID(pixart_rest1_frame_rate, 2),
+             "pixart,rest1-frame-rate must be 2-255 Hz (1 Hz hangs the pad)");
+BUILD_ASSERT(HZ_PROP_VALID(pixart_rest2_frame_rate, 2),
+             "pixart,rest2-frame-rate must be 2-255 Hz (1 Hz hangs the pad)");
+BUILD_ASSERT(HZ_PROP_VALID(pixart_sleep_report_rate, 2),
+             "pixart,sleep-report-rate must be 2-255 Hz (1 Hz hangs the pad)");
 BUILD_ASSERT(MS_PROP_VALID(pixart_rest1_timeout_ms),
              "pixart,rest1-timeout-ms must be a multiple of 50, 50-3276750");
 BUILD_ASSERT(MS_PROP_VALID(pixart_rest2_timeout_ms),
@@ -295,6 +302,9 @@ BUILD_ASSERT(IN_RANGE(REG_PROP(pixart_sleep_drive_cycle), 0, 255),
 
 static const struct {
     bool set;
+    /* SET_POWER on reloads it from the parameter section, so it is written
+     * again after every on (reapply_after_on()). */
+    bool reload_on_power_on;
     uint8_t reg;
     uint8_t width; /* bytes, little-endian */
     uint16_t val;  /* in register units */
@@ -302,20 +312,26 @@ static const struct {
     const char *name;
     const char *unit_name;
 } user_regs[] = {
-#define USER_REG(prop, reg, width, unit, name, unit_name)                                         \
-    {REG_SET(prop), reg, width, REG_PROP(prop) / (unit), unit, name, unit_name}
-    USER_REG(pixart_max_report_rate, REG_USER0_MAX_REPORT_RATE, 1, 1, "max report rate", "Hz"),
-    USER_REG(pixart_rest1_frame_rate, REG_USER0_REST1_FRAME_RATE, 1, 1, "rest1 frame rate", "Hz"),
-    USER_REG(pixart_rest2_frame_rate, REG_USER0_REST2_FRAME_RATE, 1, 1, "rest2 frame rate", "Hz"),
-    USER_REG(pixart_rest1_timeout_ms, REG_USER0_REST1_DS, 2, REST_DS_UNIT_MS, "rest1 timeout",
-             "ms"),
-    USER_REG(pixart_rest2_timeout_ms, REG_USER0_REST2_DS, 2, REST_DS_UNIT_MS, "rest2 timeout",
-             "ms"),
-    USER_REG(pixart_sleep_report_rate, REG_USER0_HID_SLEEP_REPORT_RATE, 1, 1,
+#define USER_REG(prop, reload, reg, width, unit, name, unit_name)                                 \
+    {REG_SET(prop), reload, reg, width, REG_PROP(prop) / (unit), unit, name, unit_name}
+    USER_REG(pixart_max_report_rate, false, REG_USER0_MAX_REPORT_RATE, 1, 1, "max report rate",
+             "Hz"),
+    USER_REG(pixart_rest1_frame_rate, false, REG_USER0_REST1_FRAME_RATE, 1, 1, "rest1 frame rate",
+             "Hz"),
+    /* Daisy firmware 0x1204: SET_POWER on puts REST2_FRAME_RATE back to the
+     * parameter section's value. The other registers here keep what was
+     * written (checked over 0x43 after `aster v1 --touchpad-power on`). */
+    USER_REG(pixart_rest2_frame_rate, true, REG_USER0_REST2_FRAME_RATE, 1, 1, "rest2 frame rate",
+             "Hz"),
+    USER_REG(pixart_rest1_timeout_ms, false, REG_USER0_REST1_DS, 2, REST_DS_UNIT_MS,
+             "rest1 timeout", "ms"),
+    USER_REG(pixart_rest2_timeout_ms, false, REG_USER0_REST2_DS, 2, REST_DS_UNIT_MS,
+             "rest2 timeout", "ms"),
+    USER_REG(pixart_sleep_report_rate, false, REG_USER0_HID_SLEEP_REPORT_RATE, 1, 1,
              "hid sleep report rate", "Hz"),
-    USER_REG(pixart_sleep_report_latency, REG_USER0_HID_SLEEP_REPORT_LATENCY, 1, 1,
+    USER_REG(pixart_sleep_report_latency, false, REG_USER0_HID_SLEEP_REPORT_LATENCY, 1, 1,
              "hid sleep report latency", "(raw)"),
-    USER_REG(pixart_sleep_drive_cycle, REG_USER0_HID_SLEEP_DRIVE_CYCLE, 1, 1,
+    USER_REG(pixart_sleep_drive_cycle, false, REG_USER0_HID_SLEEP_DRIVE_CYCLE, 1, 1,
              "hid sleep drive cycle", "(raw)"),
 #undef USER_REG
 };
@@ -326,39 +342,50 @@ static const struct {
      REG_SET(pixart_rest2_timeout_ms) || REG_SET(pixart_sleep_report_rate) ||                      \
      REG_SET(pixart_sleep_report_latency) || REG_SET(pixart_sleep_drive_cycle))
 
+#define ANY_RELOAD_ON_POWER_ON REG_SET(pixart_rest2_frame_rate)
+
+/* Write user_regs[i] and read it back. */
+static int user_reg_write_locked(const struct device *dev, size_t i) {
+    uint16_t val = user_regs[i].val;
+    uint8_t reg = user_regs[i].reg;
+    uint16_t got;
+    int err;
+
+    /* A 16-bit pair goes low byte first: the high byte write applies. */
+    err = user_write(dev, USER_BANK0, reg, val & 0xff);
+    if (!err && user_regs[i].width == 2) {
+        err = user_write(dev, USER_BANK0, reg + 1, val >> 8);
+    }
+    if (!err && user_regs[i].width == 2) {
+        err = read_u16(dev, REPORT_ID_USER, USER_BANK0, reg, &got);
+    } else if (!err) {
+        uint8_t b;
+
+        err = user_read(dev, USER_BANK0, reg, &b);
+        got = b;
+    }
+    if (err) {
+        return err;
+    }
+    if (got != val) {
+        LOG_ERR("%s: wrote %u %s, pad reads back %u", user_regs[i].name,
+                (unsigned int)val * user_regs[i].unit, user_regs[i].unit_name,
+                (unsigned int)got * user_regs[i].unit);
+        return -EIO;
+    }
+    return 0;
+}
+
 static int apply_rates_locked(const struct device *dev) {
     for (size_t i = 0; i < ARRAY_SIZE(user_regs); i++) {
-        uint16_t val = user_regs[i].val;
-        uint8_t reg = user_regs[i].reg;
-        uint16_t got;
-        int err;
-
         if (!user_regs[i].set) {
             continue;
         }
-        /* A 16-bit pair goes low byte first: the high byte write applies. */
-        err = user_write(dev, USER_BANK0, reg, val & 0xff);
-        if (!err && user_regs[i].width == 2) {
-            err = user_write(dev, USER_BANK0, reg + 1, val >> 8);
-        }
-        if (!err && user_regs[i].width == 2) {
-            err = read_u16(dev, REPORT_ID_USER, USER_BANK0, reg, &got);
-        } else if (!err) {
-            uint8_t b;
-
-            err = user_read(dev, USER_BANK0, reg, &b);
-            got = b;
-        }
+        int err = user_reg_write_locked(dev, i);
         if (err) {
             return err;
         }
-        if (got != val) {
-            LOG_ERR("%s: wrote %u %s, pad reads back %u", user_regs[i].name,
-                    (unsigned int)val * user_regs[i].unit, user_regs[i].unit_name,
-                    (unsigned int)got * user_regs[i].unit);
-            return -EIO;
-        }
-        LOG_INF("%s %u %s", user_regs[i].name, (unsigned int)val * user_regs[i].unit,
+        LOG_INF("%s %u %s", user_regs[i].name, (unsigned int)user_regs[i].val * user_regs[i].unit,
                 user_regs[i].unit_name);
     }
 
@@ -383,6 +410,25 @@ int pixart_tp_apply_rates(const struct device *dev) {
         return err;
     }
     err = apply_rates_locked(dev);
+    hid_touchpad_release(dev);
+    return err;
+}
+
+/* Write again what SET_POWER on reloaded from the parameter section. Only
+ * those registers, not the whole set: this runs on every wake. */
+static int reapply_after_on(const struct device *dev) {
+    if (!ANY_RELOAD_ON_POWER_ON) {
+        return 0;
+    }
+    int err = hid_touchpad_claim(dev, K_MSEC(100));
+    if (err) {
+        return err;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(user_regs) && !err; i++) {
+        if (user_regs[i].set && user_regs[i].reload_on_power_on) {
+            err = user_reg_write_locked(dev, i);
+        }
+    }
     hid_touchpad_release(dev);
     return err;
 }
@@ -476,6 +522,9 @@ int pixart_tp_set_power(const struct device *dev, enum pixart_tp_power power) {
             err = suspend_bit_write(dev, false);
         }
 #endif
+        if (!err) {
+            err = reapply_after_on(dev);
+        }
         return err;
 
     case PIXART_TP_POWER_SLEEP:

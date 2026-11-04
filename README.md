@@ -175,7 +175,8 @@ Policy (when to flash, power gating, factory hooks) belongs to the board.
 
 A PixArt pad loads its rates and idle timeouts from the firmware's parameter
 section into user registers at pad boot. Set any of these on the touchpad
-node to override them (rates in Hz, 1-255; timeouts in ms, multiples of 50;
+node to override them (rates in Hz, 1-255, but at least 2 for the idle and
+HID sleep rates: 1 Hz hangs Daisy firmware 0x1204; timeouts in ms, multiples of 50;
 the two raw HID sleep values 0-255; leave one out to keep the firmware's
 value):
 
@@ -201,6 +202,11 @@ vendor report 0x43 at boot and after every `pixart_tp_update()` (whose final
 reset reloads the firmware's values), reads each back, and logs the pad's own
 observed report rate (`OBS_REPORT_RATE`, 0x10). After anything else that
 resets the pad, a board calls `pixart_tp_apply_rates(dev)` itself.
+
+SET_POWER on reloads `pixart,rest2-frame-rate` (0x1d) from the parameter
+section (Daisy firmware 0x1204; the others keep their values), so
+`pixart_tp_set_power(dev, PIXART_TP_POWER_ON)` writes that one again after
+every on. A board that sends SET_POWER on some other way has to do the same.
 
 The Daisy firmware releases differ only in these values: 0x1202 runs
 130 / 20 / 4 Hz, 0x1203 130 / 20 / 20, 0x1204 140 / 20 / 20. The idle

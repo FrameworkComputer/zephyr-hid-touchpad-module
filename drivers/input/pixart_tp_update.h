@@ -134,6 +134,10 @@ enum pixart_tp_power {
  * HID sleep (each touch start lags) until PIXART_TP_POWER_ON. The click that
  * woke it is not reported.
  *
+ * ON also writes pixart,rest2-frame-rate again when it is set: SET_POWER on
+ * reloads REST2_FRAME_RATE from the pad's parameter section (Daisy firmware
+ * 0x1204), while the other pinned registers keep their values.
+ *
  * Leaves the DR interrupt alone; the caller decides whether reports from a
  * woken pad are read.
  * @return 0, -ENOTSUP for SUSPEND without pixart,hid-suspend-enable, or the
