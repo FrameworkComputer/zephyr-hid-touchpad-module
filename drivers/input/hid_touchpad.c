@@ -675,14 +675,22 @@ int hid_touchpad_release(const struct device *dev) {
  * may still be booting (at POST_KERNEL init, or right after a vendor reset)
  * — external startup-delay can't be relied on across init-priority
  * boundaries. Caller holds the lock (or is in init, before anyone else can
- * call). */
+ * call).
+ *
+ * A timeout ends the retries. A booting pad NACKs its address, which fails
+ * in microseconds; a transfer only times out when SCL stays low for the
+ * whole I2C_TRANSFER_TIMEOUT, which is a bus without pull-ups (no pad on a
+ * board that has them on the pad side) or a shorted line. Neither clears in
+ * 100 ms, and retrying it cost 10 x 500 ms + 9 x 100 ms = 5.9 s of boot,
+ * with USB and BLE waiting behind this POST_KERNEL init. A rail still
+ * ramping doesn't time out: the controller waits for SCL to rise. */
 static int tp_read_descriptor(const struct device *dev) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
     uint8_t hid_desc[30] = {0};
     int err = -EIO;
-    for (int attempt = 0; attempt < 10 && err != 0; attempt++) {
+    for (int attempt = 0; attempt < 10 && err != 0 && err != -ETIMEDOUT; attempt++) {
         if (attempt > 0) {
             k_msleep(100);
         }
