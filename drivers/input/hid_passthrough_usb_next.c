@@ -292,6 +292,12 @@ static int hid_passthrough_usb_init(void) {
     return 0;
 }
 
-/* Must run before zmk_usb_init (APPLICATION/ZMK_USB_INIT_PRIORITY=96),
- * since hid_device_register must happen before usbd_register_all_classes. */
+/* Must run before zmk_usb_init (APPLICATION, ZMK_USB_INIT_PRIORITY), since
+ * hid_device_register must happen before usbd_register_all_classes. Follows
+ * ZMK's keyboard HID init, so an app that brings USB up early takes this
+ * interface along. */
+#ifdef CONFIG_ZMK_USB_HID_INIT_PRIORITY
+SYS_INIT(hid_passthrough_usb_init, APPLICATION, CONFIG_ZMK_USB_HID_INIT_PRIORITY);
+#else
 SYS_INIT(hid_passthrough_usb_init, APPLICATION, 95);
+#endif
