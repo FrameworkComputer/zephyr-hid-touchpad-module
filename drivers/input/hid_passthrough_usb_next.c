@@ -280,6 +280,13 @@ static int hid_passthrough_usb_init(void) {
         return err;
     }
 
+    return 0;
+}
+
+/* The pad's input callback, split from the HID registration so that one
+ * can run as early as USB (POST_KERNEL with ZMK_USB_INIT_POST_KERNEL),
+ * before the touchpad driver has initialized. */
+static int hid_passthrough_usb_connect(void) {
     tp_dev = DEVICE_DT_GET(DT_NODELABEL(touchpad));
     if (!device_is_ready(tp_dev)) {
         LOG_WRN("Touchpad device not ready; passthrough will stay idle");
@@ -296,8 +303,11 @@ static int hid_passthrough_usb_init(void) {
  * hid_device_register must happen before usbd_register_all_classes. Follows
  * ZMK's keyboard HID init, so an app that brings USB up early takes this
  * interface along. */
-#ifdef CONFIG_ZMK_USB_HID_INIT_PRIORITY
+#if defined(CONFIG_ZMK_USB_INIT_POST_KERNEL)
+SYS_INIT(hid_passthrough_usb_init, POST_KERNEL, CONFIG_ZMK_USB_HID_INIT_PRIORITY);
+#elif defined(CONFIG_ZMK_USB_HID_INIT_PRIORITY)
 SYS_INIT(hid_passthrough_usb_init, APPLICATION, CONFIG_ZMK_USB_HID_INIT_PRIORITY);
 #else
 SYS_INIT(hid_passthrough_usb_init, APPLICATION, 95);
 #endif
+SYS_INIT(hid_passthrough_usb_connect, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
