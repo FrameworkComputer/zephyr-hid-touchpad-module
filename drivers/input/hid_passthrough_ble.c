@@ -10,6 +10,7 @@
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/sys/iterable_sections.h>
 #include <zephyr/sys/util.h>
 #include <stdlib.h>
 
@@ -129,15 +130,15 @@ static ssize_t read_ptp_input_report(struct bt_conn *conn, const struct bt_gatt_
                              sizeof(cached_ptp_report));
 }
 
-static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                                    void *buf, uint16_t len, uint16_t offset) {
-    struct hids_report *ref = (struct hids_report *)attr->user_data;
-    if (!ref || tp_dev == NULL || !device_is_ready(tp_dev)) {
-        LOG_WRN("BLE read_feature_report: ref=%p tp_dev=%p", ref, tp_dev);
+/* A host's read of feature report `id` (the pad's ID), from either service. */
+static ssize_t tp_feature_read(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
+                               uint16_t len, uint16_t offset, uint8_t id) {
+    if (tp_dev == NULL || !device_is_ready(tp_dev)) {
+        LOG_WRN("BLE read feature %u: touchpad not ready", id);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
 
-    LOG_DBG("BLE read feature id=%u len=%u offset=%u", ref->id, len, offset);
+    LOG_DBG("BLE read feature id=%u len=%u offset=%u", id, len, offset);
 
     /* One-entry response cache. A report longer than MTU-1 arrives as an
      * ATT read followed by read-blob requests at increasing offsets; each
@@ -152,23 +153,23 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
     static uint16_t feature_buf_len; /* 0 = nothing cached */
     static uint8_t feature_buf_id;
 
-    bool cached = offset > 0 && feature_buf_len > 0 && feature_buf_id == ref->id &&
+    bool cached = offset > 0 && feature_buf_len > 0 && feature_buf_id == id &&
                   offset <= feature_buf_len; /* == : the empty terminating blob */
     if (!cached) {
         uint16_t out_len = 0;
         feature_buf_len = 0;
-        int err = tp_hosts_get_feature(tp_hosts_from_conn(conn), ref->id, feature_buf,
+        int err = tp_hosts_get_feature(tp_hosts_from_conn(conn), id, feature_buf,
                                        sizeof(feature_buf), &out_len);
         if (err == -ENOENT) {
-            err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
-                                          feature_buf, sizeof(feature_buf), &out_len);
+            err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, id, feature_buf,
+                                          sizeof(feature_buf), &out_len);
         }
         if (err) {
-            LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
+            LOG_ERR("BLE get feature report %d failed: %d", id, err);
             return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
         }
         feature_buf_len = out_len;
-        feature_buf_id = ref->id;
+        feature_buf_id = id;
 
         /* BlueZ <= 5.87 drops the last byte of every numbered GET_REPORT
          * reply (bt_uhid_get_report_reply). Hand out one trailing dummy
@@ -181,17 +182,22 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
         }
 
         LOG_DBG("BLE feature id=%u returned %u bytes (first: 0x%02x)",
-                ref->id, out_len, out_len > 0 ? feature_buf[0] : 0);
+                id, out_len, out_len > 0 ? feature_buf[0] : 0);
     }
 
     return bt_gatt_attr_read(conn, attr, buf, len, offset, feature_buf, feature_buf_len);
 }
 
-static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                                     const void *buf, uint16_t len, uint16_t offset,
-                                     uint8_t flags) {
+static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                    void *buf, uint16_t len, uint16_t offset) {
     struct hids_report *ref = (struct hids_report *)attr->user_data;
-    if (!ref || tp_dev == NULL || !device_is_ready(tp_dev)) {
+    return tp_feature_read(conn, attr, buf, len, offset, ref->id);
+}
+
+/* A host's write of feature report `id` (the pad's ID), from either service. */
+static ssize_t tp_feature_write(struct bt_conn *conn, const void *buf, uint16_t len,
+                                uint16_t offset, uint8_t id) {
+    if (tp_dev == NULL || !device_is_ready(tp_dev)) {
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
     /* Known limitation: a feature SET larger than MTU-3 arrives as a
@@ -204,20 +210,30 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
 
-    int err = tp_hosts_set_feature(tp_hosts_from_conn(conn), ref->id, buf, len);
+    int err = tp_hosts_set_feature(tp_hosts_from_conn(conn), id, buf, len);
     if (err == -ENOENT) {
-        err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
+        err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, id, buf, len);
     }
     if (err) {
-        LOG_ERR("BLE set feature report %d failed: %d", ref->id, err);
+        LOG_ERR("BLE set feature report %d failed: %d", id, err);
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
 
     return len;
 }
 
+static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                     const void *buf, uint16_t len, uint16_t offset,
+                                     uint8_t flags) {
+    struct hids_report *ref = (struct hids_report *)attr->user_data;
+    return tp_feature_write(conn, buf, len, offset, ref->id);
+}
+
+static void tp_hog_check_soon(void);
+
 static void tp_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
     LOG_DBG("TP CCC changed: %d", value);
+    tp_hog_check_soon();
 }
 
 static ssize_t write_ctrl_point(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -278,6 +294,179 @@ BT_GATT_SERVICE_DEFINE(
     /* HID Control Point */
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
+
+#if IS_ENABLED(CONFIG_HID_PASSTHROUGH_BLE_HOG_PTP)
+
+/* ---- The precision touchpad in the keyboard's HID service ----
+ *
+ * Android's HID-over-GATT host uses only the first HID service on a device,
+ * the keyboard's (hog_svc sorts before tp_hog_svc), so the pad's own service
+ * is invisible to it. The keyboard's service appends hog-report-descriptor
+ * (the PTP collection, report IDs moved up by hog-report-id-offset) to its
+ * report map and carries HID_PASSTHROUGH_HOG_ATTRS: the PTP input and the
+ * features in hog-feature-report-ids. Over HOGP a report's ID is its Report
+ * Reference, not part of the value, so the frames go out unchanged.
+ *
+ * Linux, Windows and macOS use both services. Each PTP frame goes to the
+ * pad's own PTP input when the host subscribed to it, as before, and to the
+ * keyboard service's copy only when the host subscribed to that alone. The
+ * copy has no configuration collection (it wouldn't fit in 512 bytes), so
+ * such a host can't set Input Mode: tp_hog_mode_work sets its copy to PTP
+ * for it, as its driver would have, once its subscriptions have settled. */
+
+#define TP_HOG_OFFSET DT_PROP(TP_NODE, hog_report_id_offset)
+#define TP_INPUT_MODE_ID DT_PROP(TP_NODE, input_mode_report_id)
+#define TP_INPUT_MODE_PTP 3
+/* How long after the last subscription change a host's set counts as
+ * settled: a host that uses both services subscribes to all of them within
+ * a few hundred ms of connecting, and must not be taken for one that uses
+ * only the keyboard's in between. */
+#define TP_HOG_SETTLE K_SECONDS(2)
+
+const uint8_t hid_passthrough_hog_report_map[] = DT_PROP(TP_NODE, hog_report_descriptor);
+
+struct hid_passthrough_hog_report hid_passthrough_hog_input = {
+    .ref = {TP_PTP_INPUT_REPORT_ID + TP_HOG_OFFSET, HIDS_INPUT},
+    .pad_id = TP_PTP_INPUT_REPORT_ID,
+};
+
+#define HOG_FEATURE_DEF(node, prop, idx)                                                           \
+    struct hid_passthrough_hog_report hid_passthrough_hog_feature_##idx = {                       \
+        .ref = {DT_PROP_BY_IDX(node, prop, idx) + TP_HOG_OFFSET, HIDS_FEATURE},                   \
+        .pad_id = DT_PROP_BY_IDX(node, prop, idx),                                                \
+    };
+DT_FOREACH_PROP_ELEM(TP_NODE, hog_feature_report_ids, HOG_FEATURE_DEF)
+
+/* The PTP input's value attribute in the keyboard's service; found at init. */
+static const struct bt_gatt_attr *tp_hog_ptp_attr;
+
+ssize_t hid_passthrough_hog_read_input(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                       void *buf, uint16_t len, uint16_t offset) {
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, cached_ptp_report,
+                             sizeof(cached_ptp_report));
+}
+
+ssize_t hid_passthrough_hog_read_ref(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                     void *buf, uint16_t len, uint16_t offset) {
+    const struct hid_passthrough_hog_report *r = attr->user_data;
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, r->ref, sizeof(r->ref));
+}
+
+ssize_t hid_passthrough_hog_read_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                         void *buf, uint16_t len, uint16_t offset) {
+    const struct hid_passthrough_hog_report *r = attr->user_data;
+    return tp_feature_read(conn, attr, buf, len, offset, r->pad_id);
+}
+
+ssize_t hid_passthrough_hog_write_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                          const void *buf, uint16_t len, uint16_t offset,
+                                          uint8_t flags) {
+    const struct hid_passthrough_hog_report *r = attr->user_data;
+    return tp_feature_write(conn, buf, len, offset, r->pad_id);
+}
+
+/* Called before the value is stored, so only schedule the check. */
+ssize_t hid_passthrough_hog_ccc_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                      uint16_t value) {
+    LOG_DBG("keyboard-service PTP CCC = 0x%04x", value);
+    tp_hog_check_soon();
+    return sizeof(value);
+}
+
+static bool tp_subscribed(struct bt_conn *conn, const struct bt_gatt_attr *attr) {
+    return attr != NULL && bt_gatt_is_subscribed(conn, attr, BT_GATT_CCC_NOTIFY);
+}
+
+/* Whether the host on `conn` gets the pad only through the keyboard's
+ * service: subscribed to its PTP input and to neither of the pad's own. */
+static bool tp_hog_only(struct bt_conn *conn) {
+    return tp_subscribed(conn, tp_hog_ptp_attr) &&
+           !tp_subscribed(conn, &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX]) &&
+           !tp_subscribed(conn, &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX]);
+}
+
+/* Give every connected host that uses only the keyboard's service PTP mode,
+ * in its own copy of Input Mode: the pad sends PTP frames while it is
+ * selected, and the Mac/PC gesture code stands down for it as for a host
+ * whose driver set PTP. Saved with the bond, so it lasts across reconnects
+ * that restore the subscriptions without writing them. */
+static void tp_hog_mode_work_cb(struct k_work *work) {
+    for (int profile = 0; profile < ZMK_BLE_PROFILE_COUNT; profile++) {
+        struct bt_conn *conn = zmk_ble_profile_conn(profile);
+        if (conn == NULL) {
+            continue;
+        }
+        bool hog_only = tp_hog_only(conn);
+        bt_conn_unref(conn);
+        if (!hog_only) {
+            continue;
+        }
+
+        int host = TP_HOST_BLE(profile);
+        uint8_t mode = 0;
+        uint16_t n = 0;
+        int err = tp_hosts_get_feature(host, TP_INPUT_MODE_ID, &mode, 1, &n);
+        if (err || mode == TP_INPUT_MODE_PTP) {
+            continue;
+        }
+        LOG_INF("profile %d uses only the keyboard's HID service: PTP mode for it", profile);
+        mode = TP_INPUT_MODE_PTP;
+        err = tp_hosts_set_feature(host, TP_INPUT_MODE_ID, &mode, 1);
+        if (err) {
+            LOG_WRN("setting PTP mode for profile %d failed: %d", profile, err);
+        }
+    }
+}
+
+static K_WORK_DELAYABLE_DEFINE(tp_hog_mode_work, tp_hog_mode_work_cb);
+
+static void tp_hog_check_soon(void) { k_work_reschedule(&tp_hog_mode_work, TP_HOG_SETTLE); }
+
+/* The pad's PTP input to notify on `conn`. */
+static const struct bt_gatt_attr *tp_ptp_attr(struct bt_conn *conn) {
+    const struct bt_gatt_attr *own = &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
+
+    if (!tp_subscribed(conn, own) && tp_subscribed(conn, tp_hog_ptp_attr)) {
+        return tp_hog_ptp_attr;
+    }
+    return own;
+}
+
+/* Find the keyboard service's PTP input by its read callback, and check
+ * what the keyboard's report map can't. */
+static bool tp_hog_init(void) {
+    STRUCT_SECTION_FOREACH(bt_gatt_service_static, svc) {
+        for (size_t i = 0; i < svc->attr_count; i++) {
+            if (svc->attrs[i].read == hid_passthrough_hog_read_input) {
+                tp_hog_ptp_attr = &svc->attrs[i];
+            }
+        }
+    }
+    if (tp_hog_ptp_attr == NULL) {
+        LOG_ERR("no keyboard-service PTP input: is HID_PASSTHROUGH_HOG_ATTRS in hog_svc?");
+        return false;
+    }
+    if (tp_hosts_get_feature(TP_HOST_BLE(0), TP_INPUT_MODE_ID, (uint8_t[1]){0}, 1,
+                             &(uint16_t){0}) != 0) {
+        LOG_ERR("Input Mode (report %u) isn't a host-state report; keyboard-service PTP off",
+                TP_INPUT_MODE_ID);
+        tp_hog_ptp_attr = NULL;
+        return false;
+    }
+    return true;
+}
+
+#else
+
+static void tp_hog_check_soon(void) {}
+
+static const struct bt_gatt_attr *tp_ptp_attr(struct bt_conn *conn) {
+    return &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
+}
+
+static bool tp_hog_init(void) { return true; }
+
+#endif /* CONFIG_HID_PASSTHROUGH_BLE_HOG_PTP */
 
 /* Work queue for BLE notifications */
 K_THREAD_STACK_DEFINE(tp_hog_q_stack, CONFIG_HID_PASSTHROUGH_BLE_WORKQUEUE_STACK_SIZE);
@@ -511,10 +700,19 @@ static void tp_conn_le_param_updated(struct bt_conn *conn, uint16_t interval, ui
     }
 }
 
+/* A bonded host's subscriptions come back with encryption, without writes. */
+static void tp_conn_security_changed(struct bt_conn *conn, bt_security_t level,
+                                     enum bt_security_err err) {
+    if (err == BT_SECURITY_ERR_SUCCESS) {
+        tp_hog_check_soon();
+    }
+}
+
 BT_CONN_CB_DEFINE(tp_conn_callbacks) = {
     .connected = tp_conn_connected,
     .disconnected = tp_conn_disconnected,
     .le_param_updated = tp_conn_le_param_updated,
+    .security_changed = tp_conn_security_changed,
 };
 
 /* A profile switch changes which connection's interval matters without any
@@ -531,6 +729,8 @@ static int tp_profile_changed_listener(const zmk_event_t *eh) {
         conn = zmk_ble_active_profile_conn();
     }
     tp_pace_refresh(conn);
+    /* Also raised when a profile is cleared or finishes pairing. */
+    tp_hog_check_soon();
     if (conn != NULL) {
         bt_conn_unref(conn);
     }
@@ -728,7 +928,7 @@ static int tp_notify(struct bt_conn *conn, const struct tp_report_msg *msg) {
         memcpy(cached_mouse_report, msg->data,
                MIN(msg->len, sizeof(cached_mouse_report)));
     } else if (msg->report_id == TP_PTP_INPUT_REPORT_ID) {
-        attr = &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX];
+        attr = tp_ptp_attr(conn);
         memcpy(cached_ptp_report, msg->data,
                MIN(msg->len, sizeof(cached_ptp_report)));
     } else {
@@ -999,6 +1199,11 @@ static int hid_passthrough_ble_init(void) {
         if (hid_touchpad_feature_size(ble_feature_ids[i]) < 0) {
             LOG_ERR("BLE feature report %u is not in feature-report-ids", ble_feature_ids[i]);
         }
+    }
+
+    if (!tp_hog_init()) {
+        /* The pad's own service still works. */
+        LOG_WRN("touchpad not offered in the keyboard's HID service");
     }
 
     if (!tp_input_attr_ok(TP_MOUSE_INPUT_ATTR_IDX, read_mouse_input_report) ||
