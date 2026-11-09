@@ -713,24 +713,28 @@ static int tp_read_descriptor(const struct device *dev) {
     LOG_INF("PID           %02X%02X", hid_desc[23], hid_desc[22]);
     LOG_INF("Version       %02X%02X", hid_desc[25], hid_desc[24]);
 
-    data->command_reg = hid_desc[16];
-    data->data_reg = hid_desc[18];
-    data->max_input_len = sys_get_le16(&hid_desc[10]);
+    uint16_t max_input_len = sys_get_le16(&hid_desc[10]);
 
     /* A frame is at least the 2 length bytes + report ID. Anything smaller
      * means we read garbage instead of a descriptor (wrong register, pad not
      * in HID mode); the read path's report_len < 3 guard would keep us safe
-     * later, but don't present a plausible-looking driver on top of it. */
-    if (data->max_input_len < 3) {
-        LOG_ERR("implausible wMaxInputLength %d, descriptor invalid", data->max_input_len);
+     * later, but don't present a plausible-looking driver on top of it.
+     * Checked before taking any register from it: a pad answering garbage
+     * after a vendor reset must not clobber registers that still work. */
+    if (max_input_len < 3) {
+        LOG_ERR("implausible wMaxInputLength %d, descriptor invalid", max_input_len);
         return -ENODEV;
     }
     /* Clamp max_input_len to our buffer size */
-    if (data->max_input_len > sizeof(data->report_buf)) {
-        LOG_WRN("max_input_len %d exceeds buffer, clamping to %d",
-                data->max_input_len, (int)sizeof(data->report_buf));
-        data->max_input_len = sizeof(data->report_buf);
+    if (max_input_len > sizeof(data->report_buf)) {
+        LOG_WRN("max_input_len %d exceeds buffer, clamping to %d", max_input_len,
+                (int)sizeof(data->report_buf));
+        max_input_len = sizeof(data->report_buf);
     }
+
+    data->command_reg = hid_desc[16];
+    data->data_reg = hid_desc[18];
+    data->max_input_len = max_input_len;
 
     /* The input register is not needed: per I2C-HID, input reports are read
      * with a plain read (no register address). Log it for reference only. */
