@@ -130,6 +130,8 @@ LOG_MODULE_REGISTER(pixart_tp_update, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
 /* Consecutive failed polls that end a poll before its deadline: the pad is
  * gone, not busy. */
 #define POLL_MAX_ERRORS 5
+/* Erase + program attempts per sector before the update fails. */
+#define SECTOR_ATTEMPTS 3
 
 /* --- register access ------------------------------------------------------ */
 
@@ -726,6 +728,19 @@ static int flash_erase_sector(const struct device *dev, unsigned int sector) {
     return err;
 }
 
+/* Erase writes can fail like any other I2C transaction; erasing a sector
+ * again is harmless. */
+static int flash_erase_sector_retry(const struct device *dev, unsigned int sector) {
+    for (int attempt = 1;; attempt++) {
+        int err = flash_erase_sector(dev, sector);
+        if (!err || attempt == SECTOR_ATTEMPTS) {
+            return err;
+        }
+        LOG_WRN("erase sector %u failed (%d), attempt %d/%d", sector, err, attempt,
+                SECTOR_ATTEMPTS);
+    }
+}
+
 /* Load one 256-byte page into the pad's SRAM buffer via the burst report. */
 static int write_sram_page(const struct device *dev, const uint8_t *page) {
     int err = sys_write_n(dev, SYS_BANK6, REG_SYS6_SRAM_ADDR, 0x0000, 2);
@@ -740,6 +755,9 @@ static int write_sram_page(const struct device *dev, const uint8_t *page) {
                                       PAGE_SIZE);
         if (err) {
             LOG_ERR("burst write failed: %d", err);
+            /* Don't leave the SRAM selected for the retry. */
+            (void)sys_write(dev, SYS_BANK6, REG_SYS6_SRAM_TRIGGER, SRAM_TRIGGER_NCS_DISABLE);
+            return err;
         }
     }
     if (!err) {
@@ -833,18 +851,39 @@ static int write_section(const struct device *dev, const struct pixart_tp_fw_sec
         return err;
     }
     for (unsigned int i = 0; i < sectors; i++) {
-        err = flash_erase_sector(dev, first + i);
+        err = flash_erase_sector_retry(dev, first + i);
         if (err) {
             LOG_ERR("erase sector %u failed: %d", first + i, err);
             return err;
         }
     }
     for (unsigned int i = 0; i < sectors; i++) {
-        size_t off = i * SECTOR_SIZE;
-        err = write_sector(dev, first + i, sec->data + off, MIN(sec->len - off, SECTOR_SIZE), p);
-        if (err) {
-            LOG_ERR("write sector %u failed: %d", first + i, err);
-            return err;
+        const unsigned int sector = first + i;
+        const size_t off = i * SECTOR_SIZE;
+        const size_t len = MIN(sec->len - off, SECTOR_SIZE);
+        const unsigned int done_before = p->done;
+
+        /* A failed page leaves the sector half programmed (and page 0, the
+         * validity marker, unwritten): erase it again and redo the sector
+         * rather than throw away the whole update. */
+        for (int attempt = 1;; attempt++) {
+            err = write_sector(dev, sector, sec->data + off, len, p);
+            if (!err) {
+                break;
+            }
+            if (attempt == SECTOR_ATTEMPTS) {
+                LOG_ERR("write sector %u failed: %d", sector, err);
+                return err;
+            }
+            LOG_WRN("write sector %u failed (%d), erasing it again, attempt %d/%d", sector,
+                    err, attempt, SECTOR_ATTEMPTS);
+            p->done = done_before;
+            report(p, PIXART_TP_STAGE_PROGRAM);
+            err = flash_erase_sector_retry(dev, sector);
+            if (err) {
+                LOG_ERR("erase sector %u for a retry failed: %d", sector, err);
+                return err;
+            }
         }
     }
     return 0;
@@ -867,7 +906,7 @@ static int firmware_clear(const struct device *dev, const struct pixart_tp_fw_im
     if (!fw) {
         return -EINVAL;
     }
-    return flash_erase_sector(dev, fw->flash_start / SECTOR_SIZE);
+    return flash_erase_sector_retry(dev, fw->flash_start / SECTOR_SIZE);
 }
 
 static int crc_idle(const struct device *dev, bool *done) {
