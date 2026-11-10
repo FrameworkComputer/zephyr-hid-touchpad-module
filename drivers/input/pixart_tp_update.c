@@ -117,6 +117,20 @@ LOG_MODULE_REGISTER(pixart_tp_update, CONFIG_HID_TOUCHPAD_LOG_LEVEL);
 #define SECTOR_SIZE 4096
 #define PAGE_SIZE 256
 
+/* Poll deadlines. fwupd bounds its polls by count (10 for flash execute and
+ * write enable, 1000 for busy and CRC), but each of its polls is a hidraw
+ * SET+GET round trip of several ms, more through a keyboard passthrough.
+ * Ours are direct 400 kHz I2C transactions, so the same counts gave up about
+ * three times sooner. Bound by time instead, with margin over fwupd's
+ * effective limits; they only cost anything when the pad is failing. */
+#define FLASH_EXEC_TIMEOUT_MS 50
+#define FLASH_WEL_TIMEOUT_MS 50
+#define FLASH_BUSY_TIMEOUT_MS 5000
+#define CRC_TIMEOUT_MS 15000
+/* Consecutive failed polls that end a poll before its deadline: the pad is
+ * gone, not busy. */
+#define POLL_MAX_ERRORS 5
+
 /* --- register access ------------------------------------------------------ */
 
 static int reg_write(const struct device *dev, uint8_t report, uint8_t bank, uint8_t addr,
@@ -588,8 +602,58 @@ static int clear_hid_suspend_at_boot(void) {
 SYS_INIT(clear_hid_suspend_at_boot, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif
 
+/* --- polling ---------------------------------------------------------------- */
+
+/* One poll: 0 with *done set when the condition holds, 0 with *done clear
+ * when not yet, or an error. Must be safe to repeat after an error. */
+typedef int (*poll_fn)(const struct device *dev, bool *done);
+
+/* fwupd polls with fu_device_retry_full(), which retries its callback on any
+ * failure, the register access's included: a NACK or a short reply while
+ * the pad's flash engine is busy only means "not yet". Do the same, until
+ * the deadline or until POLL_MAX_ERRORS polls in a row fail. */
+static int poll_until(const struct device *dev, poll_fn fn, uint32_t timeout_ms,
+                      uint32_t interval_ms, const char *what) {
+    const int64_t t0 = k_uptime_get();
+    unsigned int polls = 0, errors = 0;
+
+    for (;;) {
+        bool done = false;
+        int err = fn(dev, &done);
+        polls++;
+        if (err) {
+            if (++errors >= POLL_MAX_ERRORS) {
+                LOG_ERR("%s: %u failed polls in a row, last %d", what, errors, err);
+                return err;
+            }
+        } else if (done) {
+            LOG_DBG("%s: %u polls, %lld ms", what, polls, k_uptime_get() - t0);
+            return 0;
+        } else {
+            errors = 0;
+        }
+        if (k_uptime_get() - t0 >= timeout_ms) {
+            LOG_ERR("%s: timed out after %u ms, %u polls", what, timeout_ms, polls);
+            return -ETIMEDOUT;
+        }
+        if (interval_ms) {
+            k_msleep(interval_ms);
+        }
+    }
+}
+
 /* --- flash engine ---------------------------------------------------------- */
 
+static int flash_execute_done(const struct device *dev, bool *done) {
+    uint8_t st;
+    int err = sys_read(dev, SYS_BANK4, REG_SYS4_FLASH_EXECUTE, &st);
+    *done = !err && st == FLASH_EXEC_SUCCESS;
+    return err;
+}
+
+/* Starting a command is not repeated on an error: it isn't obviously
+ * idempotent. Callers retry at a level where it is (a status read, a
+ * sector). */
 static int flash_execute(const struct device *dev, uint8_t inst, uint32_t ccr, uint16_t cnt) {
     int err = sys_write(dev, SYS_BANK4, REG_SYS4_FLASH_INST_CMD, inst);
     if (!err) {
@@ -604,21 +668,11 @@ static int flash_execute(const struct device *dev, uint8_t inst, uint32_t ccr, u
     if (err) {
         return err;
     }
-    for (int i = 0; i < 10; i++) {
-        uint8_t st;
-        err = sys_read(dev, SYS_BANK4, REG_SYS4_FLASH_EXECUTE, &st);
-        if (err) {
-            return err;
-        }
-        if (st == FLASH_EXEC_SUCCESS) {
-            return 0;
-        }
-        k_msleep(1);
-    }
-    LOG_ERR("flash execute inst=0x%02x ccr=0x%08x timed out", inst, ccr);
-    return -ETIMEDOUT;
+    return poll_until(dev, flash_execute_done, FLASH_EXEC_TIMEOUT_MS, 1, "flash execute");
 }
 
+/* Repeatable as a whole, which is how fwupd's write-enable and busy polls
+ * use it: every poll issues READ_STATUS afresh. */
 static int flash_read_status(const struct device *dev, uint8_t *status) {
     int err = flash_execute(dev, FLASH_INST_RD2_REG_BANK, FLASH_CCR_READ_STATUS, 1);
     if (err) {
@@ -628,38 +682,30 @@ static int flash_read_status(const struct device *dev, uint8_t *status) {
     return sys_read(dev, SYS_BANK4, REG_SYS4_FLASH_STATUS, status);
 }
 
+static int flash_wel_set(const struct device *dev, bool *done) {
+    uint8_t st;
+    int err = flash_read_status(dev, &st);
+    *done = !err && (st & FLASH_STATUS_WEL);
+    return err;
+}
+
 static int flash_write_enable(const struct device *dev) {
     int err = flash_execute(dev, FLASH_INST_NONE, FLASH_CCR_WRITE_ENABLE, 0);
     if (err) {
         return err;
     }
-    for (int i = 0; i < 10; i++) {
-        uint8_t st;
-        err = flash_read_status(dev, &st);
-        if (err) {
-            return err;
-        }
-        if (st & FLASH_STATUS_WEL) {
-            return 0;
-        }
-    }
-    LOG_ERR("flash write enable: WEL never set");
-    return -ETIMEDOUT;
+    return poll_until(dev, flash_wel_set, FLASH_WEL_TIMEOUT_MS, 0, "flash write enable");
+}
+
+static int flash_not_busy(const struct device *dev, bool *done) {
+    uint8_t st;
+    int err = flash_read_status(dev, &st);
+    *done = !err && !(st & FLASH_STATUS_BUSY);
+    return err;
 }
 
 static int flash_wait_busy(const struct device *dev) {
-    for (int i = 0; i < 1000; i++) {
-        uint8_t st;
-        int err = flash_read_status(dev, &st);
-        if (err) {
-            return err;
-        }
-        if (!(st & FLASH_STATUS_BUSY)) {
-            return 0;
-        }
-    }
-    LOG_ERR("flash still busy after 1000 polls");
-    return -ETIMEDOUT;
+    return poll_until(dev, flash_not_busy, FLASH_BUSY_TIMEOUT_MS, 0, "flash busy");
 }
 
 static int flash_erase_sector(const struct device *dev, unsigned int sector) {
@@ -824,24 +870,23 @@ static int firmware_clear(const struct device *dev, const struct pixart_tp_fw_im
     return flash_erase_sector(dev, fw->flash_start / SECTOR_SIZE);
 }
 
+static int crc_idle(const struct device *dev, bool *done) {
+    uint8_t st;
+    int err = user_read(dev, USER_BANK0, REG_USER0_CRC_CTRL, &st);
+    *done = !err && !(st & CRC_CTRL_BUSY);
+    return err;
+}
+
 static int pad_crc(const struct device *dev, uint8_t ctrl, uint32_t *crc) {
     int err = user_write(dev, USER_BANK0, REG_USER0_CRC_CTRL, ctrl);
     if (err) {
         return err;
     }
-    for (int i = 0; i < 1000; i++) {
-        uint8_t st;
-        err = user_read(dev, USER_BANK0, REG_USER0_CRC_CTRL, &st);
-        if (err) {
-            return err;
-        }
-        if (!(st & CRC_CTRL_BUSY)) {
-            return user_read_u32(dev, REG_USER0_CRC_RESULT, crc);
-        }
-        k_msleep(10);
+    err = poll_until(dev, crc_idle, CRC_TIMEOUT_MS, 10, "CRC engine");
+    if (err) {
+        return err;
     }
-    LOG_ERR("CRC engine (ctrl 0x%02x) never finished", ctrl);
-    return -ETIMEDOUT;
+    return user_read_u32(dev, REG_USER0_CRC_RESULT, crc);
 }
 
 static int verify_section(const struct device *dev, const struct pixart_tp_fw_image *img,
