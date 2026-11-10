@@ -495,6 +495,11 @@ static int hid_touchpad_report_data(const struct device *dev) {
         /* Claimed: the owner disabled DR and will drain on release. */
         return err;
     }
+    if (data->no_descriptor) {
+        /* A drain queued before the descriptor went away. */
+        tp_unlock(data);
+        return -ENODEV;
+    }
     err = i2c_read_dt(&config->i2c_bus, data->report_buf, data->max_input_len);
     tp_unlock(data);
 #ifdef CONFIG_HID_TOUCHPAD_INPUT_STATS
@@ -616,11 +621,30 @@ static int tp_arm_dr(const struct device *dev) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
+    if (data->no_descriptor) {
+        /* No wMaxInputLength to frame a read with, and a pad in ROM mode has
+         * nothing to report. hid_touchpad_reinit_descriptor() arms it once
+         * a descriptor read works again. */
+        return 0;
+    }
     int ret = set_int(dev, true);
     if (ret == 0 && gpio_pin_get_dt(&config->dr) > 0) {
         k_work_submit_to_queue(&tp_workq, &data->work);
     }
     return ret;
+}
+
+/* tp_arm_dr() outside PM: the DR interrupt is off while the device is PM
+ * suspended (PM_DEVICE_ACTION_SUSPEND) and must stay off, PM resume arms it
+ * again. */
+static int tp_arm_dr_unless_pm_suspended(const struct device *dev) {
+#if IS_ENABLED(CONFIG_PM_DEVICE)
+    enum pm_device_state pm_state;
+    if (pm_device_state_get(dev, &pm_state) == 0 && pm_state == PM_DEVICE_STATE_SUSPENDED) {
+        return 0;
+    }
+#endif
+    return tp_arm_dr(dev);
 }
 
 int hid_touchpad_claim(const struct device *dev, k_timeout_t timeout) {
@@ -658,15 +682,7 @@ int hid_touchpad_release(const struct device *dev) {
     }
     data->claim_owner = NULL;
     LOG_DBG("released");
-#if IS_ENABLED(CONFIG_PM_DEVICE)
-    /* The DR interrupt was off before the claim (PM_DEVICE_ACTION_SUSPEND)
-     * and must stay off: PM resume arms it again. */
-    enum pm_device_state pm_state;
-    if (pm_device_state_get(dev, &pm_state) == 0 && pm_state == PM_DEVICE_STATE_SUSPENDED) {
-        return 0;
-    }
-#endif
-    return tp_arm_dr(dev);
+    return tp_arm_dr_unless_pm_suspended(dev);
 }
 
 /* Read the 30-byte I2C HID descriptor from the configured register and
@@ -699,6 +715,7 @@ static int tp_read_descriptor(const struct device *dev) {
     }
     if (err) {
         LOG_ERR("Failed to read HID descriptor: %d", err);
+        data->no_descriptor = true;
         return -ENODEV;
     }
 
@@ -723,6 +740,7 @@ static int tp_read_descriptor(const struct device *dev) {
      * after a vendor reset must not clobber registers that still work. */
     if (max_input_len < 3) {
         LOG_ERR("implausible wMaxInputLength %d, descriptor invalid", max_input_len);
+        data->no_descriptor = true;
         return -ENODEV;
     }
     /* Clamp max_input_len to our buffer size */
@@ -735,6 +753,7 @@ static int tp_read_descriptor(const struct device *dev) {
     data->command_reg = hid_desc[16];
     data->data_reg = hid_desc[18];
     data->max_input_len = max_input_len;
+    data->no_descriptor = false;
 
     /* The input register is not needed: per I2C-HID, input reports are read
      * with a plain read (no register address). Log it for reference only. */
@@ -749,9 +768,26 @@ int hid_touchpad_reinit_descriptor(const struct device *dev) {
     if (err) {
         return err;
     }
+    const bool had_none = data->no_descriptor;
     err = tp_read_descriptor(dev);
+    /* Claimed, DR is off anyway and hid_touchpad_release() decides. */
+    const bool unclaimed = data->claim_owner == NULL;
     tp_unlock(data);
+    if (had_none && !err) {
+        LOG_INF("pad presents a HID descriptor again; input back on");
+        if (unclaimed) {
+            tp_arm_dr_unless_pm_suspended(dev);
+        }
+    } else if (!had_none && err && unclaimed) {
+        set_int(dev, false);
+    }
     return err;
+}
+
+bool hid_touchpad_has_descriptor(const struct device *dev) {
+    const struct hid_touchpad_data *data = dev->data;
+
+    return !data->no_descriptor;
 }
 
 static int hid_touchpad_init(const struct device *dev) {
@@ -777,7 +813,19 @@ static int hid_touchpad_init(const struct device *dev) {
 
     err = tp_read_descriptor(dev);
     if (err) {
-        return err;
+        if (!config->has_fallback_regs) {
+            return err;
+        }
+        /* Most likely a pad left in ROM mode by an interrupted firmware
+         * update. Failing init here would leave nobody able to reflash it,
+         * so come up on the part's documented registers: feature reports
+         * work, input stays off until a descriptor read succeeds. */
+        data->command_reg = config->fallback_command_reg;
+        data->data_reg = config->fallback_data_reg;
+        data->max_input_len = 0;
+        LOG_WRN("no HID descriptor; feature reports only, on command_reg=0x%02x "
+                "data_reg=0x%02x",
+                data->command_reg, data->data_reg);
     }
 
     /* Do NOT disable PTP — let the OS control input mode via feature reports */
@@ -817,7 +865,8 @@ static int hid_touchpad_init(const struct device *dev) {
 
     tp_arm_dr(dev);
 
-    LOG_INF("HID touchpad passthrough initialized at 0x%x", config->i2c_bus.addr);
+    LOG_INF("HID touchpad passthrough initialized at 0x%x%s", config->i2c_bus.addr,
+            data->no_descriptor ? " without a HID descriptor" : "");
 
     return 0;
 }
@@ -836,6 +885,9 @@ static void tp_discard_pending(const struct device *dev) {
     const struct hid_touchpad_config *config = dev->config;
     uint8_t buf[sizeof(data->report_buf)];
 
+    if (data->no_descriptor) {
+        return;
+    }
     for (int i = 0; i < TP_DRAIN_BURST && gpio_pin_get_dt(&config->dr) > 0; i++) {
         if (tp_lock(data)) {
             return;
@@ -873,11 +925,20 @@ static int hid_touchpad_pm_action(const struct device *dev, enum pm_device_actio
 #endif /* IS_ENABLED(CONFIG_PM_DEVICE) */
 
 #define HID_TOUCHPAD_INIT(n)                                                                      \
+    BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, fallback_command_register) ==                          \
+                     DT_INST_NODE_HAS_PROP(n, fallback_data_register),                            \
+                 "fallback-command-register and fallback-data-register go together");             \
+    BUILD_ASSERT(DT_INST_PROP_OR(n, fallback_command_register, 0) <= UINT8_MAX &&                \
+                     DT_INST_PROP_OR(n, fallback_data_register, 0) <= UINT8_MAX,                  \
+                 "the driver addresses command/data registers with one byte");                    \
     static struct hid_touchpad_data hid_touchpad_data_##n;                                        \
     static const struct hid_touchpad_config hid_touchpad_config_##n = {                           \
         .i2c_bus = I2C_DT_SPEC_INST_GET(n),                                                      \
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                 \
         .hid_desc_register = DT_INST_PROP(n, hid_descriptor_register),                            \
+        .has_fallback_regs = DT_INST_NODE_HAS_PROP(n, fallback_command_register),                \
+        .fallback_command_reg = DT_INST_PROP_OR(n, fallback_command_register, 0),                \
+        .fallback_data_reg = DT_INST_PROP_OR(n, fallback_data_register, 0),                      \
     };                                                                                            \
     PM_DEVICE_DT_INST_DEFINE(n, hid_touchpad_pm_action);                                          \
     DEVICE_DT_INST_DEFINE(n, hid_touchpad_init, PM_DEVICE_DT_INST_GET(n),                         \

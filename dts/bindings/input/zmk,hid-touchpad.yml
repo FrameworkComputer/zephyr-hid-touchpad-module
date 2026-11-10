@@ -23,6 +23,23 @@ properties:
     required: true
     description: I2C register address for the HID descriptor (e.g. 0x20)
 
+  fallback-command-register:
+    type: int
+    description: >
+      Command register to use when the pad presents no usable HID
+      descriptor at init, from the part's datasheet (e.g. PixArt PCT1036:
+      0x22). With it, and fallback-data-register, the driver comes up
+      anyway, with feature reports working and input off until a
+      descriptor read succeeds, so a pad left in ROM mode by an
+      interrupted firmware update can still be reflashed. Without them,
+      init fails as before. Both or neither.
+
+  fallback-data-register:
+    type: int
+    description: >
+      Data register to go with fallback-command-register (PixArt PCT1036:
+      0x23).
+
   report-descriptor:
     type: uint8-array
     required: true

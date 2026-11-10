@@ -36,6 +36,11 @@ struct hid_touchpad_config {
     struct i2c_dt_spec i2c_bus;
     const struct gpio_dt_spec dr;
     uint8_t hid_desc_register;
+    /* fallback-command-register / fallback-data-register: used when the pad
+     * presents no usable HID descriptor at init (see hid_touchpad_has_descriptor). */
+    bool has_fallback_regs;
+    uint8_t fallback_command_reg;
+    uint8_t fallback_data_reg;
 };
 
 typedef void (*hid_touchpad_input_cb_t)(const struct device *dev, uint8_t report_id,
@@ -98,6 +103,11 @@ struct hid_touchpad_data {
     bool retained_held;
     /* Writes the retained values again after the pad reset itself. */
     struct k_work reset_work;
+    /* The last descriptor read failed (a pad in ROM mode, or not answering):
+     * command_reg/data_reg are the previous or fallback values, and the DR
+     * interrupt stays off, since input reports can't be framed. Written under
+     * `lock` (or in init). */
+    bool no_descriptor;
 };
 
 /**
@@ -287,8 +297,23 @@ int hid_touchpad_release(const struct device *dev);
  * registers are only guaranteed for the descriptor they came from. Retries
  * for up to ~1 s while the pad comes back. Subject to the claim like every
  * other call.
+ *
+ * On failure the previous registers are kept and the pad counts as having
+ * no descriptor (hid_touchpad_has_descriptor() false, DR interrupt off). On
+ * success input comes back on: at once when nobody holds the claim, else
+ * when the claim is released.
  */
 int hid_touchpad_reinit_descriptor(const struct device *dev);
+
+/**
+ * Whether the last descriptor read succeeded. False means the pad answered
+ * with no usable I2C HID descriptor, or not at all: typically a PixArt pad
+ * in ROM mode after a failed firmware update. The driver then still comes
+ * up when the node has fallback-command-register / fallback-data-register,
+ * so feature reports (what a firmware update uses) keep working, but it
+ * reads no input until a descriptor read succeeds.
+ */
+bool hid_touchpad_has_descriptor(const struct device *dev);
 
 #ifdef __cplusplus
 }
