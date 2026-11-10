@@ -91,7 +91,10 @@ static int get_report_cb(const struct device *dev, const uint8_t type, const uin
         err = tp_hosts_get_feature(TP_HOST_USB, id, buf + 1, len - 1, &out_len);
     }
     if (err == -ENOENT) {
-        err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf + 1, len - 1, &out_len);
+        const int64_t start = k_uptime_get();
+        do {
+            err = hid_touchpad_get_report(tp_dev, i2c_type, id, buf + 1, len - 1, &out_len);
+        } while (hid_touchpad_busy_retry(err, start));
     }
     if (err) {
         LOG_ERR("get_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);
@@ -132,7 +135,10 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
         err = tp_hosts_set_feature(TP_HOST_USB, id, buf + 1, len - 1);
     }
     if (err == -ENOENT) {
-        err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf + 1, len - 1);
+        const int64_t start = k_uptime_get();
+        do {
+            err = hid_touchpad_set_report(tp_dev, i2c_type, id, buf + 1, len - 1);
+        } while (hid_touchpad_busy_retry(err, start));
     }
     if (err) {
         LOG_ERR("set_report proxy failed type=0x%02x id=%u: %d", i2c_type, id, err);

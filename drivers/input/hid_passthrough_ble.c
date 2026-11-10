@@ -160,8 +160,13 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
         int err = tp_hosts_get_feature(tp_hosts_from_conn(conn), ref->id, feature_buf,
                                        sizeof(feature_buf), &out_len);
         if (err == -ENOENT) {
-            err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
-                                          feature_buf, sizeof(feature_buf), &out_len);
+            /* Blocks the BT RX thread while the pad is busy: a few ms
+             * normally, HID_TOUCHPAD_BUSY_WAIT_MS at most. */
+            const int64_t start = k_uptime_get();
+            do {
+                err = hid_touchpad_get_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id,
+                                              feature_buf, sizeof(feature_buf), &out_len);
+            } while (hid_touchpad_busy_retry(err, start));
         }
         if (err) {
             LOG_ERR("BLE get feature report %d failed: %d", ref->id, err);
@@ -206,7 +211,10 @@ static ssize_t write_feature_report(struct bt_conn *conn, const struct bt_gatt_a
 
     int err = tp_hosts_set_feature(tp_hosts_from_conn(conn), ref->id, buf, len);
     if (err == -ENOENT) {
-        err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
+        const int64_t start = k_uptime_get();
+        do {
+            err = hid_touchpad_set_report(tp_dev, I2C_HID_REPORT_TYPE_FEATURE, ref->id, buf, len);
+        } while (hid_touchpad_busy_retry(err, start));
     }
     if (err) {
         LOG_ERR("BLE set feature report %d failed: %d", ref->id, err);

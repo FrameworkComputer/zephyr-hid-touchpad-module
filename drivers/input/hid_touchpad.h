@@ -8,6 +8,7 @@
 #pragma once
 
 #include <zephyr/device.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
@@ -239,6 +240,31 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state);
  */
 void hid_touchpad_set_suspended(const struct device *dev, bool suspended);
 bool hid_touchpad_is_suspended(const struct device *dev);
+
+/** How long a host's report request waits for a busy pad (hid_touchpad_busy_retry). */
+#define HID_TOUCHPAD_BUSY_WAIT_MS 50
+
+/**
+ * For a passthrough serving a host's report request: whether to send the
+ * request to the pad again after it failed with @p err.
+ *
+ * True for -EBUSY, after a 1 ms sleep, until HID_TOUCHPAD_BUSY_WAIT_MS have
+ * passed since @p start (k_uptime_get() before the first try). The pad is
+ * busy for a few ms exactly when a host is most likely to ask: when it
+ * configures the device or reconnects, host-follow turns the pad on, which
+ * takes ~10 ms of SET_POWER while a HID-suspended pad wakes (the driver
+ * refuses everything else meanwhile), then claims for the PixArt suspend
+ * bit and the rest2 rate rewrite. A pad that stays busy (suspended because
+ * the host's endpoint isn't selected, or a firmware update's multi-second
+ * claim) still fails, after the bound.
+ */
+static inline bool hid_touchpad_busy_retry(int err, int64_t start) {
+    if (err != -EBUSY || k_uptime_get() - start >= HID_TOUCHPAD_BUSY_WAIT_MS) {
+        return false;
+    }
+    k_msleep(1);
+    return true;
+}
 
 /**
  * Mute the pad's input (`muted` true): reports the pad's DR announces are
