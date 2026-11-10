@@ -74,6 +74,9 @@ typedef void (*pixart_tp_progress_cb_t)(enum pixart_tp_update_stage stage, unsig
  * Read part ID, boot status and firmware version. Claims the pad for the
  * duration (a register read is a SET followed by a GET and must not be
  * split), so it fails with -EBUSY/-EALREADY while someone else holds it.
+ *
+ * A pad in HID suspend (hid_touchpad_set_suspended) is woken with SET_POWER
+ * on first, since any read would wake it. Whoever suspended it puts it back.
  */
 int pixart_tp_read_info(const struct device *dev, struct pixart_tp_info *info);
 

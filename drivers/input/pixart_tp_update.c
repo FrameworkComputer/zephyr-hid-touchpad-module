@@ -277,7 +277,15 @@ int pixart_tp_read_info(const struct device *dev, struct pixart_tp_info *info) {
     if (err) {
         return err;
     }
-    err = read_info_locked(dev, info);
+    if (hid_touchpad_is_suspended(dev)) {
+        /* The register reads would wake it anyway, and the driver refuses
+         * them while it is marked suspended (-EBUSY). Wake it properly. */
+        LOG_INF("waking the suspended pad to read it");
+        err = hid_touchpad_set_power(dev, I2C_HID_PWR_ON);
+    }
+    if (!err) {
+        err = read_info_locked(dev, info);
+    }
     hid_touchpad_release(dev);
     return err;
 }
