@@ -109,6 +109,13 @@ struct hid_touchpad_data {
      * interrupt stays off, since input reports can't be framed. Written under
      * `lock` (or in init). */
     bool no_descriptor;
+    /* The descriptor read at init (or hid_touchpad_reinit_descriptor()) timed
+     * out on the bus: no pad is fitted and SCL/SDA float (a bare board without
+     * the transfer board's pull-ups). Report calls then fail at once instead of
+     * waiting out the I2C timeout every time, each of which would hold USB EP0
+     * for the whole wait. A NACK does not set this: a busy pad NACKs too. The
+     * pad is not hot-pluggable, so nothing looks for it again until a reboot. */
+    bool absent;
 };
 
 /**
