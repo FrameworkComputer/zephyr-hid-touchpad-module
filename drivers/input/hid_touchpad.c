@@ -187,6 +187,10 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
+    if (data->absent) {
+        return -ENODEV;
+    }
+
     /* I2C HID frames responses as [len_lo, len_hi, report_id, data...].
      * The caller's buf is sized for the unframed payload only (e.g. USB
      * passes wLength from the host), so do the I2C transfer into a local
@@ -262,6 +266,10 @@ int hid_touchpad_set_report(const struct device *dev, uint8_t type, uint8_t id,
     const struct hid_touchpad_config *config = dev->config;
 
     /* Wire format: [data_reg, 0x00, len_lo, len_hi, report_id, data...] */
+
+    if (data->absent) {
+        return -ENODEV;
+    }
 
     if (id <= 0x0F) {
         /* cmd: [cmd_reg, 0x00, (type|id), SET_REPORT] + [data_reg, 0x00, len_lo, len_hi, id, data...] */
@@ -766,6 +774,9 @@ static int tp_read_descriptor(const struct device *dev) {
         err = i2c_burst_read_dt(&config->i2c_bus, config->hid_desc_register,
                                 hid_desc, sizeof(hid_desc));
     }
+    /* A timeout means nothing drives the bus at all: no pad (see `absent`).
+     * A NACK or a garbage descriptor is a pad that is there. */
+    data->absent = err == -ETIMEDOUT;
     if (err) {
         LOG_ERR("Failed to read HID descriptor: %d", err);
         data->no_descriptor = true;
@@ -889,7 +900,9 @@ static int hid_touchpad_init(const struct device *dev) {
      * forever. Send SET_POWER on unconditionally — a no-op when already
      * running. */
     uint8_t pwr_cmd[4] = {data->command_reg, 0x00, I2C_HID_PWR_ON, I2C_HID_SET_POWER};
-    err = i2c_write_dt(&config->i2c_bus, pwr_cmd, sizeof(pwr_cmd));
+    /* No pad on the bus: this write would only wait out another bus timeout
+     * in front of USB and BLE init. */
+    err = data->absent ? -ENODEV : i2c_write_dt(&config->i2c_bus, pwr_cmd, sizeof(pwr_cmd));
     if (err) {
         LOG_WRN("SET_POWER on at init failed: %d", err);
     }
