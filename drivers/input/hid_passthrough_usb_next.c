@@ -62,6 +62,16 @@ static int get_report_cb(const struct device *dev, const uint8_t type, const uin
 
     LOG_DBG("get_report: type=%u id=0x%02x len=%u", type, id, len);
 
+    /* The pad's capabilities come from devicetree, pad or no pad (see
+     * static-feature-report-ids): no I2C inside the control transfer. */
+    if (type == HID_REPORT_TYPE_FEATURE && len >= 1) {
+        int n = hid_touchpad_static_feature(id, buf + 1, len - 1);
+        if (n >= 0) {
+            buf[0] = id;
+            return n + 1;
+        }
+    }
+
     if (tp_dev == NULL || !device_is_ready(tp_dev)) {
         return -ENOTSUP;
     }

@@ -48,6 +48,59 @@ int hid_touchpad_feature_size(uint8_t id) {
     return -ENOENT;
 }
 
+/* Static feature reports: the pad's capabilities, answered to hosts from
+ * devicetree (see the binding). Laid out back to back in
+ * static-feature-reports, each as long as its feature-report-sizes entry. */
+BUILD_ASSERT(DT_INST_NODE_HAS_PROP(0, static_feature_report_ids) ==
+                 DT_INST_NODE_HAS_PROP(0, static_feature_reports),
+             "static-feature-report-ids and static-feature-reports go together");
+#if DT_INST_NODE_HAS_PROP(0, static_feature_report_ids)
+static const uint8_t tp_static_ids[] = DT_INST_PROP(0, static_feature_report_ids);
+static const uint8_t tp_static_data[] = DT_INST_PROP(0, static_feature_reports);
+
+int hid_touchpad_static_feature(uint8_t id, uint8_t *buf, uint16_t buf_len) {
+    size_t off = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(tp_static_ids); i++) {
+        int size = hid_touchpad_feature_size(tp_static_ids[i]);
+        if (size < 0 || off + size > sizeof(tp_static_data)) {
+            break; /* logged by tp_check_static_features() at init */
+        }
+        if (tp_static_ids[i] == id) {
+            size = MIN(size, buf_len);
+            memcpy(buf, &tp_static_data[off], size);
+            return size;
+        }
+        off += size;
+    }
+    return -ENOENT;
+}
+
+/* The ids and data are checked here rather than at build time, since the
+ * sizes come from another property: a mismatch only sends those GETs to the
+ * pad again, so say so loudly once. */
+static void tp_check_static_features(void) {
+    size_t total = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(tp_static_ids); i++) {
+        int size = hid_touchpad_feature_size(tp_static_ids[i]);
+        if (size < 0) {
+            LOG_ERR("static feature report %u is not in feature-report-ids", tp_static_ids[i]);
+            return;
+        }
+        total += size;
+    }
+    if (total != sizeof(tp_static_data)) {
+        LOG_ERR("static-feature-reports holds %u bytes, its reports take %u",
+                (unsigned int)sizeof(tp_static_data), (unsigned int)total);
+    }
+}
+#else
+int hid_touchpad_static_feature(uint8_t id, uint8_t *buf, uint16_t buf_len) { return -ENOENT; }
+
+static void tp_check_static_features(void) {}
+#endif
+
 /* Dedicated work queue for reading input reports. The system workqueue is
  * NOT safe here: the ZMK HID submit paths run on it and can block it for up
  * to their TX-semaphore timeout (100 ms in usb_hid.c), which starves the
@@ -800,6 +853,7 @@ static int hid_touchpad_init(const struct device *dev) {
     data->claim_owner = NULL;
     k_mutex_init(&data->retained_lock);
     k_work_init(&data->reset_work, tp_reset_work_cb);
+    tp_check_static_features();
 
     if (!device_is_ready(config->i2c_bus.bus)) {
         LOG_WRN("i2c bus not ready!");
