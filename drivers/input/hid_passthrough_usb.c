@@ -58,8 +58,14 @@ static int get_report_cb(const struct device *dev, struct usb_setup_packet *setu
     report_buf[0] = report_id;
     int err = -ENOENT;
     if (i2c_type == I2C_HID_REPORT_TYPE_FEATURE) {
-        err = tp_hosts_get_feature(TP_HOST_USB, report_id, report_buf + 1,
-                                   sizeof(report_buf) - 1, &out_len);
+        int n = hid_touchpad_static_feature(report_id, report_buf + 1, sizeof(report_buf) - 1);
+        if (n >= 0) {
+            out_len = n;
+            err = 0;
+        } else {
+            err = tp_hosts_get_feature(TP_HOST_USB, report_id, report_buf + 1,
+                                       sizeof(report_buf) - 1, &out_len);
+        }
     }
     if (err == -ENOENT) {
         err = hid_touchpad_get_report(tp_dev, i2c_type, report_id,

@@ -168,6 +168,14 @@ int hid_touchpad_get_report(const struct device *dev, uint8_t type, uint8_t id,
 int hid_touchpad_feature_size(uint8_t id);
 
 /**
+ * A host's GET of a static feature report (static-feature-report-ids):
+ * copy its devicetree value into @p buf without asking the pad.
+ * @return bytes copied (at most @p buf_len), or -ENOENT if @p id is not a
+ * static report: ask the pad.
+ */
+int hid_touchpad_static_feature(uint8_t id, uint8_t *buf, uint16_t buf_len);
+
+/**
  * Set a feature/output report on the touchpad via I2C HID protocol.
  * @param type Report type (I2C_HID_REPORT_TYPE_FEATURE, etc.)
  * @param id   Report ID

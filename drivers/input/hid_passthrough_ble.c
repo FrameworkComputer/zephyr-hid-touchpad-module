@@ -157,8 +157,14 @@ static ssize_t read_feature_report(struct bt_conn *conn, const struct bt_gatt_at
     if (!cached) {
         uint16_t out_len = 0;
         feature_buf_len = 0;
-        int err = tp_hosts_get_feature(tp_hosts_from_conn(conn), ref->id, feature_buf,
+        int err = hid_touchpad_static_feature(ref->id, feature_buf, sizeof(feature_buf));
+        if (err >= 0) {
+            out_len = err;
+            err = 0;
+        } else {
+            err = tp_hosts_get_feature(tp_hosts_from_conn(conn), ref->id, feature_buf,
                                        sizeof(feature_buf), &out_len);
+        }
         if (err == -ENOENT) {
             /* Blocks the BT RX thread while the pad is busy: a few ms
              * normally, HID_TOUCHPAD_BUSY_WAIT_MS at most. */
