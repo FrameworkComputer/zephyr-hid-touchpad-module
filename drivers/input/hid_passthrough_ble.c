@@ -648,6 +648,22 @@ void hid_passthrough_ble_resample_mouse(bool on) {
     k_spin_unlock(&tp_pending_lock, key);
 }
 
+bool hid_passthrough_ble_host_reads_pad(void) {
+    if (!zmk_ble_active_profile_is_connected()) {
+        return false;
+    }
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    if (conn == NULL) {
+        return false;
+    }
+    bool reads = bt_gatt_is_subscribed(conn, &tp_hog_svc.attrs[TP_MOUSE_INPUT_ATTR_IDX],
+                                       BT_GATT_CCC_NOTIFY) ||
+                 bt_gatt_is_subscribed(conn, &tp_hog_svc.attrs[TP_PTP_INPUT_ATTR_IDX],
+                                       BT_GATT_CCC_NOTIFY);
+    bt_conn_unref(conn);
+    return reads;
+}
+
 /* Touchpad notifications handed to the stack and not sent on yet, per
  * connection. ATT has CONFIG_BT_ATT_TX_COUNT buffers for everything every
  * host gets -- keys, the pad, responses to the host's requests -- and a
