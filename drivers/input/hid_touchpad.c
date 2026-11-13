@@ -367,6 +367,10 @@ int hid_touchpad_set_power(const struct device *dev, uint8_t state) {
     struct hid_touchpad_data *data = dev->data;
     const struct hid_touchpad_config *config = dev->config;
 
+    if (data->absent) {
+        return -ENODEV;
+    }
+
     /* Command low byte carries the power state in bits [1:0], high byte the
      * SET_POWER opcode in bits [3:0]. No response follows. */
     uint8_t msg[4] = {data->command_reg, 0x00, state, I2C_HID_SET_POWER};
